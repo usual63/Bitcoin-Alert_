@@ -3,8 +3,9 @@ import pandas as pd
 import requests
 import os
 import re
+import time
 
-# 환경 변수 설정 (GitHub Secrets 등에 등록 필요)
+# 환경 변수 설정
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('CHAT_ID')
 
@@ -16,27 +17,47 @@ def send_telegram(message):
     except Exception as e:
         print(f"텔레그램 전송 실패: {e}")
 
-def get_vix_data():
-    # 200일선 계산을 위해 넉넉히 500일치 데이터 호출 및 5대 지표 티커 추가
+def get_vix_data(retries=3, delay=5):
+    """데이터 다운로드 실패 시 재시도하는 방어 로직 추가"""
     tickers = ["^VIX", "^VVIX", "^VIX3M"]
-    data = yf.download(tickers, period="500d")['Close']
     
-    df = pd.DataFrame(index=data.index)
-    df['Close'] = data['^VIX']
-    df['VVIX'] = data['^VVIX']
-    df['VIX3M'] = data['^VIX3M']
-    
-    # 4대 핵심 이동평균선 생성
-    df['sma5'] = df['Close'].rolling(window=5).mean()
-    df['sma20'] = df['Close'].rolling(window=20).mean()
-    df['sma50'] = df['Close'].rolling(window=50).mean()
-    df['sma200'] = df['Close'].rolling(window=200).mean()
-    
-    # 볼린저 밴드 %B 추가
-    std = df['Close'].rolling(window=20).std()
-    df['pct_b'] = (df['Close'] - (df['sma20'] - 2*std)) / (4*std)
-    
-    return df.dropna()
+    for attempt in range(retries):
+        try:
+            # yfinance 다운로드 시 멀티스레딩 끄기 (database locked 방지)
+            data = yf.download(tickers, period="500d", threads=False)['Close']
+            
+            # 데이터가 비어있으면 에러 발생시켜 재시도 유도
+            if data.empty or data['^VIX'].isnull().all():
+                raise ValueError("Downloaded data is empty")
+                
+            df = pd.DataFrame(index=data.index)
+            df['Close'] = data['^VIX']
+            df['VVIX'] = data['^VVIX']
+            df['VIX3M'] = data['^VIX3M']
+            
+            # 이평선 계산
+            df['sma5'] = df['Close'].rolling(window=5).mean()
+            df['sma20'] = df['Close'].rolling(window=20).mean()
+            df['sma50'] = df['Close'].rolling(window=50).mean()
+            df['sma200'] = df['Close'].rolling(window=200).mean()
+            
+            # 볼린저 밴드
+            std = df['Close'].rolling(window=20).std()
+            df['pct_b'] = (df['Close'] - (df['sma20'] - 2*std)) / (4*std)
+            
+            # 결측치 제거 후 빈 데이터프레임인지 재확인
+            final_df = df.dropna()
+            if final_df.empty:
+                 raise ValueError("Dataframe is empty after dropna()")
+                 
+            return final_df
+            
+        except Exception as e:
+            print(f"데이터 수집 실패 (시도 {attempt + 1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)  # 5초 대기 후 재시도
+            else:
+                return None # 3번 다 실패하면 None 반환
 
 def check_condition(df, short_col, long_col, condition='above', days=3, buffer=0.0):
     recent = df.tail(days)
@@ -84,9 +105,7 @@ def get_confidence_score(curr):
     return score
 
 def get_detailed_action(prev_num, curr_num):
-    """국면 변화에 따른 상세 행동강령 매핑"""
     transition = f"{prev_num}->{curr_num}"
-    
     actions = {
         "1->2": "상승 추세 중 일시적인 흔들림입니다. 포지션을 유지하며 관망하시고 추가 매수는 자제하세요",
         "2->3": "중기 추세가 무너졌으므로 즉시 자산의 70%를 현금화하세요. '조금 더 오르면 팔자'는 생각이 가장 위험합니다",
@@ -97,23 +116,27 @@ def get_detailed_action(prev_num, curr_num):
         "6->5": "V자 반등인 줄 알았으나 다시 공포가 커지는 재발작 단계입니다. 투입 자금을 회수해 현금 비중을 67%까지 높이세요",
         "3->2": "하락장으로 가려다 상승장으로 복귀했습니다. 확보했던 현금을 다시 투입하여 기존 비중을 회복하세요"
     }
-    
     return actions.get(transition, "국면 변화에 따른 비중 조절 및 포지션 재평가를 검토하세요")
 
 def get_score_modifier(score):
-    """신뢰도 점수에 따른 최종 실행 지침 (사용자 요구사항 완벽 반영)"""
     if score >= 4:
         return f"🔥 [최우선 집행 / 신뢰도 {score}점] 보조 지표가 매우 강력합니다. 위의 상세 행동강령을 100% 즉시 이행하세요"
     elif score == 3:
         return f"⚠️ [보수적 집행 / 신뢰도 {score}점] 신호는 유효하나 노이즈가 있습니다. 위 행동강령 지침의 50%만 먼저 실행하세요"
     else:
-        return f"🛑 [집행 보류 / 신뢰도 {score}점] 핵심 신호가 발생했으나 보조 지표 신뢰도가 3점 미만입니다. 위 지침의 절반 미만만 실행하거나 하루 더 관망하는 전략을 취하세요"
+        return f"🛑 [집행 보류 / 신뢰도 {score}점] 핵심 신호가 발생했으나 보조 지표 신뢰도가 낮습니다. 위 지침의 절반 미만만 실행하거나 하루 더 관망하는 전략을 취하세요"
 
 def analyze_regime():
     df = get_vix_data()
     
+    # [방어 로직] 3번 재시도 후에도 데이터를 못 가져오면 텔레그램으로 알림
+    if df is None or df.empty:
+        error_msg = "🚨 *VIX 엔진 오류 알림*\n\n현재 야후 파이낸스 서버 불안정으로 데이터를 수집할 수 없습니다. 봇 실행을 안전하게 중단합니다. (database is locked 오류 등 방지)"
+        send_telegram(error_msg)
+        return
+
     curr_phase, curr_action, curr_memo = get_phase_info(df)
-    prev_phase, _, _ = get_phase_info(df.iloc[:-1]) 
+    prev_phase, _, _ = get_phase_info(df.iloc[:-2]) # 데이터 안정성을 위해 하루 더 띄움
     
     curr_data = df.iloc[-1]
     vix = curr_data['Close']
@@ -121,7 +144,6 @@ def analyze_regime():
     
     score = get_confidence_score(curr_data)
 
-    # 평상시(변화 없음) 리포트 구성
     report = (
         f"📊 *VIX 탑다운 매크로 매트릭스*\n\n"
         f"🔹 VIX 현재가: `{round(vix, 2)}`\n"
@@ -129,7 +151,6 @@ def analyze_regime():
         f"📍 현재 상태: **{curr_phase}**"
     )
 
-    # 상태 변화 발생 시에만 동작하는 상세 알림 로직
     if curr_phase != prev_phase:
         match_curr = re.search(r'\d+', curr_phase)
         match_prev = re.search(r'\d+', prev_phase)
@@ -145,7 +166,6 @@ def analyze_regime():
         else:
             direction_msg = "📉 *위험 신호 포착*"
 
-        # 핵심 추가 사항: 상세 행동강령 및 점수 보정 메시지 생성
         detailed_action = get_detailed_action(prev_num, curr_num)
         score_modifier = get_score_modifier(score)
 
