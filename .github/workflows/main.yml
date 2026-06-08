@@ -1,23 +1,29 @@
-name: VIX-Automation
+name: Bitcoin Quant Alert Daily
 
 on:
   schedule:
-    - cron: '5 22 * * *' # UTC 22:05 (한국 시간 오전 7:05)
-  workflow_dispatch: # 직접 실행 버튼
+    # 한국 시간(KST) 매일 오전 6시 = UTC 기준 매일 오후 9시 (21:00)
+    - cron: '0 21 * * *'
+  workflow_dispatch: # 수동 실행 버튼 활성화
 
 jobs:
-  run-strategy:
+  run-alert:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository code
+        uses: actions/checkout@v3
+
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-network: '3.10'
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run Script
+        run: |
+          pip install requests pyyaml
+
+      - name: Run Bitcoin Strategy Alert
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python vix_strategy.py
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python btc_alert_script.py
