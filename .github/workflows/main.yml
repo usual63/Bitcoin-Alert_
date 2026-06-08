@@ -10,13 +10,16 @@ jobs:
   run-alert:
     runs-on: ubuntu-latest
     steps:
+      # 버전 v3 -> v4로 업데이트
       - name: Checkout repository code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
+      # 버전 v4 -> v5로 업데이트
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-network: '3.10'
+          # 오타 수정: python-network -> python-version
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
