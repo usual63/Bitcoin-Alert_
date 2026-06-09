@@ -3,13 +3,13 @@ import requests
 from datetime import datetime
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (Bitget & CryptoQuant)
+# [1] 실시간 API 데이터 수집 모듈 (Bybit Alternate Routing)
 # =========================================================================
 
 def fetch_market_data():
     """
-    비트겟(Bitget) V2 퍼블릭 API를 통해 실시간 데이터를 수집합니다.
-    (대소문자 규격 엄수 및 holdingAmount 파싱 적용 완료)
+    바이비트(Bybit) V5 퍼블릭 API를 통해 실시간 데이터를 수집합니다.
+    api.bytick.com 은 CloudFront 국가 차단을 우회하기 위해 공식 지원되는 미러 도메인입니다.
     """
     market_data = {
         'price': 0.0,
@@ -28,32 +28,31 @@ def fetch_market_data():
     }
     
     try:
-        # 1. 가격, 펀딩비, 미결제약정 (Tickers) - usdt-fum 소문자 적용
-        ticker_url = "https://api.bitget.com/api/v2/mix/market/ticker?symbol=BTCUSDT&productType=usdt-fum"
-        res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
+        # 1. 가격, 펀딩비, 미결제약정 (Tickers)
+        ticker_url = "https://api.bytick.com/v5/market/tickers"
+        ticker_params = {"category": "linear", "symbol": "BTCUSDT"}
+        res_ticker = requests.get(ticker_url, headers=headers, params=ticker_params, timeout=10)
         
         if res_ticker.status_code != 200:
             print(f"API 에러 (Status {res_ticker.status_code}): {res_ticker.text[:200]}")
             return market_data
             
-        ticker_res = res_ticker.json()['data'][0]
+        ticker_res = res_ticker.json()['result']['list'][0]
         
-        market_data['price'] = float(ticker_res['lastPr'])
-        # 펀딩비 연환산 (8시간 기준 * 3 * 365)
+        market_data['price'] = float(ticker_res['markPrice'])
         market_data['funding_rate_annual'] = float(ticker_res['fundingRate']) * 3 * 365 * 100
-        
-        # 비트겟 V2는 미결제약정을 'holdingAmount'로 표기함
-        oi_base = float(ticker_res.get('holdingAmount', 0))
-        market_data['oi_value'] = oi_base * market_data['price']
+        market_data['oi_value'] = float(ticker_res['openInterest']) * market_data['price']
         
         # 2. 오더북 뎁스 (호가창 진공 상태 파악)
-        depth_url = "https://api.bitget.com/api/v2/mix/market/depth?symbol=BTCUSDT&productType=usdt-fum&limit=50"
-        depth_res = requests.get(depth_url, headers=headers, timeout=10).json()['data']
-        market_data['bid_depth'] = sum([float(b[1]) for b in depth_res['bids']])
+        depth_url = "https://api.bytick.com/v5/market/orderbook"
+        depth_params = {"category": "linear", "symbol": "BTCUSDT", "limit": 50}
+        depth_res = requests.get(depth_url, headers=headers, params=depth_params, timeout=10).json()['result']
+        market_data['bid_depth'] = sum([float(b[1]) for b in depth_res['b']])
         
         # 3. 15분봉 캔들 기반 단기 미시구조 (ATR, VWAP, 아래꼬리 스윕)
-        klines_url = "https://api.bitget.com/api/v2/mix/market/candles?symbol=BTCUSDT&productType=usdt-fum&granularity=15m&limit=14"
-        klines_res = requests.get(klines_url, headers=headers, timeout=10).json()['data']
+        klines_url = "https://api.bytick.com/v5/market/kline"
+        klines_params = {"category": "linear", "symbol": "BTCUSDT", "interval": "15", "limit": 14}
+        klines_res = requests.get(klines_url, headers=headers, params=klines_params, timeout=10).json()['result']['list']
         klines = klines_res[::-1] 
         
         tr_list = []
@@ -80,10 +79,11 @@ def fetch_market_data():
         if lower_wick > (body * 2):
             market_data['is_sweep_candle'] = True
 
-        # 4. 스테이블코인 뱅크런 디페깅 확인
-        peg_url = "https://api.bitget.com/api/v2/spot/market/tickers?symbol=USDCUSDT"
-        peg_res = requests.get(peg_url, headers=headers, timeout=10).json()['data'][0]
-        market_data['stablecoin_peg'] = float(peg_res['lastPr'])
+        # 4. 스테이블코인 뱅크런 디페깅 확인 (USDC/USDT 현물 마켓 기준)
+        peg_url = "https://api.bytick.com/v5/market/tickers"
+        peg_params = {"category": "spot", "symbol": "USDCUSDT"}
+        peg_res = requests.get(peg_url, headers=headers, params=peg_params, timeout=10).json()['result']['list'][0]
+        market_data['stablecoin_peg'] = float(peg_res['lastPrice'])
 
     except Exception as e:
         print(f"시장 데이터 수집 중 에러 발생: {e}")
@@ -245,16 +245,20 @@ def send_telegram_message(text):
 def main():
     print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작...")
     
+    # 1. API 데이터 실시간 수집 (CloudFront 방어벽 우회 도메인 사용)
     market_data = fetch_market_data()
     onchain_data = fetch_onchain_data()
     
+    # 2. 전략 엔진 구동 및 시나리오 도출
     scenario, total_score = analyze_strategy(market_data, onchain_data)
     btc_current_price = market_data.get('price', 0.0)
     
+    # 가격 로드 실패 시 방어 로직
     if btc_current_price == 0.0:
         print("API 통신 지연으로 가격을 불러오지 못했습니다. 실행을 종료합니다.")
         return
         
+    # 3. 알림 메시지 생성 및 발송
     alert_message = get_strategy_message(scenario, btc_current_price, total_score)
     send_telegram_message(alert_message)
     print("시스템 스캔 및 프로세스 종료")
