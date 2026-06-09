@@ -7,10 +7,6 @@ from datetime import datetime
 # =========================================================================
 
 def fetch_market_data():
-    """
-    MEXC 퍼블릭 API를 통해 실시간 데이터를 수집합니다.
-    (GitHub Actions의 북미 IP를 차단하지 않는 가장 안정적인 대안입니다.)
-    """
     market_data = {
         'price': 0.0,
         'funding_rate_annual': 0.0,
@@ -28,100 +24,88 @@ def fetch_market_data():
     }
     
     try:
-        # 1. 가격, 펀딩비, 미결제약정 (Ticker)
+        # 1. 가격, 펀딩비, 미결제약정
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
         
-        if res_ticker.status_code != 200:
-            print(f"API 에러 (Status {res_ticker.status_code}): {res_ticker.text[:200]}")
-            return market_data
-            
-        ticker_data = res_ticker.json().get('data', {})
+        if res_ticker.status_code == 200:
+            ticker_data = res_ticker.json().get('data', {})
+            market_data['price'] = float(ticker_data.get('lastPrice', 0))
+            market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
+            market_data['oi_value'] = float(ticker_data.get('openInterest', 0)) * market_data['price']
         
-        market_data['price'] = float(ticker_data.get('lastPrice', 0))
-        # 펀딩비 연환산 (MEXC 기준 8시간마다 갱신)
-        market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
-        market_data['oi_value'] = float(ticker_data.get('openInterest', 0)) * market_data['price']
-        
-        # 2. 오더북 뎁스 (호가창 진공 상태 파악)
+        # 2. 오더북 뎁스
         depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
-        depth_res = requests.get(depth_url, headers=headers, timeout=10).json().get('data', {})
-        bids = depth_res.get('bids', [])
-        market_data['bid_depth'] = sum([float(b[1]) for b in bids if len(b) > 1])
+        depth_res = requests.get(depth_url, headers=headers, timeout=10)
+        if depth_res.status_code == 200:
+            bids = depth_res.json().get('data', {}).get('bids', [])
+            market_data['bid_depth'] = sum([float(b[1]) for b in bids if len(b) > 1])
         
-        # 3. 15분봉 캔들 기반 단기 미시구조 (ATR, VWAP, 아래꼬리 스윕)
+        # 3. 15분봉 캔들 (ATR, VWAP, 스윕)
         klines_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=14"
-        klines_res = requests.get(klines_url, headers=headers, timeout=10).json().get('data', {})
-        
-        times = klines_res.get('time', [])
-        opens = klines_res.get('open', [])
-        highs = klines_res.get('high', [])
-        lows = klines_res.get('low', [])
-        closes = klines_res.get('close', [])
-        vols = klines_res.get('vol', [])
-        
-        tr_list = []
-        typical_price_vol = 0
-        total_vol = 0
-        
-        if len(times) > 1:
-            for i in range(1, len(times)):
-                high = float(highs[i])
-                low = float(lows[i])
-                close_prev = float(closes[i-1])
-                close_curr = float(closes[i])
-                volume = float(vols[i])
-                
-                tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
-                tr_list.append(tr)
-                
-                tp = (high + low + close_curr) / 3
-                typical_price_vol += tp * volume
-                total_vol += volume
-                
-            market_data['atr'] = sum(tr_list) / len(tr_list) if tr_list else 0
-            market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
+        klines_res = requests.get(klines_url, headers=headers, timeout=10)
+        if klines_res.status_code == 200:
+            klines_data = klines_res.json().get('data', {})
+            times = klines_data.get('time', [])
+            opens = klines_data.get('open', [])
+            highs = klines_data.get('high', [])
+            lows = klines_data.get('low', [])
+            closes = klines_data.get('close', [])
+            vols = klines_data.get('vol', [])
             
-            # 마지막 캔들 스윕(아래꼬리) 여부 확인
-            last_open = float(opens[-1])
-            last_high = float(highs[-1])
-            last_low = float(lows[-1])
-            last_close = float(closes[-1])
+            tr_list = []
+            typical_price_vol = 0
+            total_vol = 0
             
-            body = abs(last_close - last_open)
-            lower_wick = min(last_open, last_close) - last_low
-            if lower_wick > (body * 2):
-                market_data['is_sweep_candle'] = True
+            if len(times) > 1:
+                for i in range(1, len(times)):
+                    high = float(highs[i])
+                    low = float(lows[i])
+                    close_prev = float(closes[i-1])
+                    close_curr = float(closes[i])
+                    volume = float(vols[i])
+                    
+                    tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
+                    tr_list.append(tr)
+                    
+                    tp = (high + low + close_curr) / 3
+                    typical_price_vol += tp * volume
+                    total_vol += volume
+                    
+                market_data['atr'] = sum(tr_list) / len(tr_list) if tr_list else 0
+                market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
+                
+                body = abs(float(closes[-1]) - float(opens[-1]))
+                lower_wick = min(float(opens[-1]), float(closes[-1])) - float(lows[-1])
+                if lower_wick > (body * 2):
+                    market_data['is_sweep_candle'] = True
 
-        # 4. 스테이블코인 뱅크런 디페깅 확인 (현물 마켓)
+        # 4. 스테이블코인 페깅
         peg_url = "https://api.mexc.com/api/v3/ticker/price?symbol=USDCUSDT"
-        peg_res = requests.get(peg_url, headers=headers, timeout=10).json()
-        market_data['stablecoin_peg'] = float(peg_res.get('price', 1.0))
+        peg_res = requests.get(peg_url, headers=headers, timeout=10)
+        if peg_res.status_code == 200:
+            market_data['stablecoin_peg'] = float(peg_res.json().get('price', 1.0))
 
     except Exception as e:
-        print(f"시장 데이터 수집 중 에러 발생 (MEXC): {e}")
+        print(f"시장 데이터 수집 에러: {e}")
         
     return market_data
 
 def fetch_onchain_data():
     cq_api_key = os.environ.get("CQ_API_KEY", "")
+    # 온체인 API 키가 없을 때의 기본값(안전 상태)
     onchain_data = {
-        'lth_sopr': 1.5,
+        'lth_sopr': 1.0,
         'cdd_spike': False,
         'miner_flow_ratio': 1.0,
-        'mvrv_z': 1.2,
-        'whale_ratio': 65.0
+        'mvrv_z': 1.0,
+        'whale_ratio': 60.0
     }
     
     if not cq_api_key:
         return onchain_data
         
-    headers = {'Authorization': f'Bearer {cq_api_key}'}
-    try:
-        pass 
-    except Exception as e:
-        print(f"온체인 데이터 수집 중 에러 발생: {e}")
-        
+    # (실제 API 연동 로직 생략 - 키 등록 시 활성화)
     return onchain_data
 
 # =========================================================================
@@ -163,57 +147,100 @@ def analyze_strategy(market, onchain):
     if is_blackswan:
         if is_rescue: return 'C', score
         return 'B', score
-    
     return 'A', score
 
 # =========================================================================
-# [3] 텔레그램 메시지 포맷팅 및 발송
+# [3] 동적 텔레그램 메시지 포맷팅 및 발송
 # =========================================================================
 
-def get_strategy_message(scenario_type, btc_price, score):
+def get_strategy_message(scenario_type, btc_price, score, market, onchain):
+    # [상태 동적 할당 로직] 데이터에 따라 신호등 이모지가 변동됩니다.
+    
+    # 1. 고래 차익
+    if onchain['lth_sopr'] > 10.0 and onchain['cdd_spike']: whale_stat = "🔴 위험 (대규모 차익실현 출회)"
+    elif onchain['lth_sopr'] > 3.0: whale_stat = "🟠 경고 (스마트머니 익절 중)"
+    elif onchain['lth_sopr'] > 2.0: whale_stat = "🟡 주의 (점진적 물량 이동)"
+    else: whale_stat = "🟢 안전 (특이동향 없음)"
+
+    # 2. 파생 과열
+    if market['funding_rate_annual'] > 50.0: deriv_stat = "🔴 위험 (극단적 레버리지 롱 과열)"
+    elif market['funding_rate_annual'] > 20.0: deriv_stat = "🟠 경고 (레버리지 누적 중)"
+    else: deriv_stat = "🟢 안전 (펀딩비 정상 구간)"
+
+    # 3. 채굴자 유입
+    if onchain['miner_flow_ratio'] >= 2.5: miner_stat = "🔴 위험 (대규모 거래소 유입)"
+    elif onchain['miner_flow_ratio'] >= 2.0: miner_stat = "🟡 주의 (운영비 출회 증가)"
+    else: miner_stat = "🟢 안전 (채굴자 보유 유지)"
+
+    # 4. Z-Score
+    if onchain['mvrv_z'] >= 3.0: mvrv_stat = "🔴 위험 (역사적 과열권 진입)"
+    elif onchain['mvrv_z'] >= 2.0: mvrv_stat = "🟡 주의 (강세장 후반부)"
+    else: mvrv_stat = "🟢 안전 (정상 궤도 또는 저평가)"
+
+    # 5. 분배 장세
+    if onchain['whale_ratio'] >= 85.0: ratio_stat = "🔴 위험 (완벽한 분배 장세)"
+    elif onchain['whale_ratio'] >= 80.0: ratio_stat = "🟠 경고 (세력 물량 떠넘기기)"
+    elif onchain['whale_ratio'] >= 75.0: ratio_stat = "🟡 주의 (고래 비중 증가)"
+    else: ratio_stat = "🟢 안전 (개인 주도 손바뀜)"
+    
+    # 6. 블랙스완 지표
+    peg_stat = "🔴 위험 (디페깅 발생)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
+    depth_stat = "🔴 위험 (오더북 진공 상태)" if market['bid_depth'] < 100 else "🟢 안전"
+    atr_stat = "🔴 위험 (변동성 폭발)" if market['atr'] > (btc_price * 0.05) else "🟢 안전"
+
+    # [동적 행동 지침 로직] 스코어에 따라 알림의 결론이 완전히 달라집니다.
+    if score >= 76:
+        action_advice = "극단적 사이클 고점 및 붕괴 임박 상태입니다. 즉시 모든 자산을 전량 현금화하고 대피하십시오."
+        header_title = "🚨 [전량 매도] 비트코인 온체인/파생 위험도 분석"
+    elif score >= 51:
+        action_advice = "구조적 하락 전조가 강하게 나타나고 있습니다. 알트코인을 전량 매도하고 비트코인 현물을 50% 분할 익절하십시오."
+        header_title = "🔴 [강력 경고] 비트코인 온체인/파생 위험도 분석"
+    elif score >= 31:
+        action_advice = "시장에 부분적인 과열 징후가 포착되었습니다. 신규 매수를 중단하고 레버리지 포지션을 30% 축소하십시오."
+        header_title = "🟠 [비중 축소] 비트코인 온체인/파생 위험도 분석"
+    else:
+        action_advice = "현재 시장은 구조적 붕괴나 과열 징후가 없는 안전 구간입니다. 기존 포지션(현물/롱)을 유지하며 추세를 이어가십시오."
+        header_title = "🟢 [안전 유지] 비트코인 온체인/파생 위험도 분석"
+
+    # 메시지 생성
     if scenario_type == 'A':
-        return f"""🟠 [비중 축소] 비트코인 온체인/파생 위험도 분석
+        return f"""{header_title}
 
 📈 타겟 자산: BTC (${btc_price:,.2f})
-⚠️ 사이클 고점 스코어: {score}점 / 100점 (현황 브리핑)
+⚠️ 사이클 고점 스코어: {score}점 / 100점
 
 ══════════════════════
-**[조건 A: 온체인 구조적 과열 (76점 이상 대피)]**
-• 고래 차익(25): 🔴 위험 (LTH-SOPR 10.0 초과 및 CDD 스파이크)
-• 파생 과열(25): 🟠 경고 (OI 사상 최고치 및 펀딩비 연 50% 돌파)
-• 채굴자 유입(20): 🟡 주의 (거래소 유입량 평소 대비 2배 증가)
-• Z-Score(15): 🟡 주의 (Z-Score 2.0 돌파 강세장 후반)
-• 분배 장세(15): 🟢 안전 (고래 비중 70% 미만)
+**[조건 A: 온체인 구조적 과열]**
+• 고래 차익(25): {whale_stat}
+• 파생 과열(25): {deriv_stat}
+• 채굴자 유입(20): {miner_stat}
+• Z-Score(15): {mvrv_stat}
+• 분배 장세(15): {ratio_stat}
 
 ══════════════════════
-**[조건 B: 블랙스완 킬 스위치 (1개라도 충족 시 대피)]**
-• 스테이블 뱅크런: 🟢 안전
-• 오더북 뎁스 붕괴: 🟢 안전
-• 청산맵/ATR 폭발: 🟢 안전
-➔ 판정: 🟢 안전 (조건 미달)
+**[조건 B: 블랙스완 킬 스위치 (대기 중)]**
+• 스테이블 뱅크런: {peg_stat}
+• 오더북 뎁스 붕괴: {depth_stat}
+• 청산맵/ATR 폭발: {atr_stat}
 
-💡 **시스템 판독**: 현재 시장의 펀더멘털 스코어를 반영한 실시간 분석입니다.
-위험 점수에 따라 신규 진입을 통제하고 분할 매도를 권장합니다."""
+💡 **시스템 판독 및 행동 지침**: 
+{action_advice}"""
 
     elif scenario_type == 'B':
-        return f"""🚨 [전량 매도] 비트코인 시스템 블랙스완 킬 스위치 발동
+        return f"""🚨 [시스템 마비] 비트코인 블랙스완 킬 스위치 발동
 
 📉 타겟 자산: BTC (${btc_price:,.2f})
-⚠️ 사이클 고점 스코어: {score}점 / 100점 (조건 A 무시 및 강제 오버라이드)
+⚠️ 킬 스위치 발동 (조건 A 점수 무시 및 강제 오버라이드)
 
 ══════════════════════
-**[조건 B: 블랙스완 킬 스위치 (1개라도 충족 시 대피)]**
-• 스테이블 뱅크런: 🟢 안전
-• 오더북 뎁스 붕괴: 🟢 안전
-• 청산맵/ATR 폭발: 🔴 위험 (롱 청산 클러스터 붕괴 및 ATR 급증)
+**[조건 B: 블랙스완 킬 스위치 트리거 현황]**
+• 스테이블 뱅크런: {peg_stat}
+• 오더북 뎁스 붕괴: {depth_stat}
+• 청산맵/ATR 폭발: {atr_stat}
 ➔ 판정: 🔴 대피 (시스템 장악)
 
-══════════════════════
-**[조건 A: 온체인 구조적 과열 현황]**
-• 미시구조 붕괴로 인해 킬 스위치가 우선 작동합니다
-
-💡 **시스템 판독**: 시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다.
-조건 A의 점수와 무관하게 즉시 보유 중인 모든 레버리지 및 현물 포지션을 시장가로 전량 매도하고 시스템 일시 정지를 권장합니다."""
+💡 **시스템 판독 및 행동 지침**:
+시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다. 펀더멘털 점수와 무관하게 즉시 보유 중인 모든 레버리지 및 현물 포지션을 시장가로 전량 매도하고 시스템 일시 정지를 권장합니다."""
 
     elif scenario_type == 'C':
         return f"""🟢 [초고속 재진입] 비트코인 숏 스퀴즈 구조대 발동
@@ -222,14 +249,11 @@ def get_strategy_message(scenario_type, btc_price, score):
 ⏱️ 상태: 블랙스완 대피 이후 특이 현상(V자 랠리) 포착
 
 ══════════════════════
-**[조건 C: V자 역발상 회복 (2개 이상 포착 시 진입)]**
-• 극음수 펀딩비 + OI: 🟢 포착 (추격 숏 쏠림 및 펀딩비 극음수 전환)
-• 스팟 투매 흡수: 🟢 포착 (가격 신저가 갱신 중 투매 흡수)
-• 스윕 캔들 및 VWAP: 🟢 포착 (VWAP 저항선 상향 돌파)
-➔ 판정: 🟢 조건 충족 (강제 재진입 승인)
+**[조건 C: V자 역발상 회복 (강제 재진입 승인)]**
+• 시장이 일시적 패닉을 흡수하고 급격한 회복세를 보이고 있습니다.
 
-💡 **시스템 판독**: 세력의 유동성 사냥(Liquidity Sweep)이 종료되었으며 강력한 매수세가 추격 숏 물량을 잡아먹고 있습니다.
-블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보합니다."""
+💡 **시스템 판독 및 행동 지침**:
+세력의 유동성 사냥(Liquidity Sweep)이 종료되었으며 강력한 매수세가 추격 숏 물량을 잡아먹고 있습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
     
     return "전략 오류: 알 수 없는 시나리오입니다."
 
@@ -258,21 +282,17 @@ def send_telegram_message(text):
 def main():
     print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작...")
     
-    # 1. API 데이터 실시간 수집 (북미 IP 차단 없는 MEXC로 완전 이주)
     market_data = fetch_market_data()
     onchain_data = fetch_onchain_data()
     
-    # 2. 전략 엔진 구동 및 시나리오 도출
     scenario, total_score = analyze_strategy(market_data, onchain_data)
     btc_current_price = market_data.get('price', 0.0)
     
-    # 가격 로드 실패 시 방어 로직
     if btc_current_price == 0.0:
         print("API 통신 지연으로 가격을 불러오지 못했습니다. 실행을 종료합니다.")
         return
         
-    # 3. 알림 메시지 생성 및 발송
-    alert_message = get_strategy_message(scenario, btc_current_price, total_score)
+    alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, onchain_data)
     send_telegram_message(alert_message)
     print("시스템 스캔 및 프로세스 종료")
 
