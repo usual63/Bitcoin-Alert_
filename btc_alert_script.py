@@ -3,13 +3,13 @@ import requests
 from datetime import datetime
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (Bybit Alternate Routing)
+# [1] 실시간 API 데이터 수집 모듈 (MEXC - IP 차단 우회 최종 솔루션)
 # =========================================================================
 
 def fetch_market_data():
     """
-    바이비트(Bybit) V5 퍼블릭 API를 통해 실시간 데이터를 수집합니다.
-    api.bytick.com 은 CloudFront 국가 차단을 우회하기 위해 공식 지원되는 미러 도메인입니다.
+    MEXC 퍼블릭 API를 통해 실시간 데이터를 수집합니다.
+    (GitHub Actions의 북미 IP를 차단하지 않는 가장 안정적인 대안입니다.)
     """
     market_data = {
         'price': 0.0,
@@ -23,70 +23,83 @@ def fetch_market_data():
     }
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     }
     
     try:
-        # 1. 가격, 펀딩비, 미결제약정 (Tickers)
-        ticker_url = "https://api.bytick.com/v5/market/tickers"
-        ticker_params = {"category": "linear", "symbol": "BTCUSDT"}
-        res_ticker = requests.get(ticker_url, headers=headers, params=ticker_params, timeout=10)
+        # 1. 가격, 펀딩비, 미결제약정 (Ticker)
+        ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
+        res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
         
         if res_ticker.status_code != 200:
             print(f"API 에러 (Status {res_ticker.status_code}): {res_ticker.text[:200]}")
             return market_data
             
-        ticker_res = res_ticker.json()['result']['list'][0]
+        ticker_data = res_ticker.json().get('data', {})
         
-        market_data['price'] = float(ticker_res['markPrice'])
-        market_data['funding_rate_annual'] = float(ticker_res['fundingRate']) * 3 * 365 * 100
-        market_data['oi_value'] = float(ticker_res['openInterest']) * market_data['price']
+        market_data['price'] = float(ticker_data.get('lastPrice', 0))
+        # 펀딩비 연환산 (MEXC 기준 8시간마다 갱신)
+        market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
+        market_data['oi_value'] = float(ticker_data.get('openInterest', 0)) * market_data['price']
         
         # 2. 오더북 뎁스 (호가창 진공 상태 파악)
-        depth_url = "https://api.bytick.com/v5/market/orderbook"
-        depth_params = {"category": "linear", "symbol": "BTCUSDT", "limit": 50}
-        depth_res = requests.get(depth_url, headers=headers, params=depth_params, timeout=10).json()['result']
-        market_data['bid_depth'] = sum([float(b[1]) for b in depth_res['b']])
+        depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
+        depth_res = requests.get(depth_url, headers=headers, timeout=10).json().get('data', {})
+        bids = depth_res.get('bids', [])
+        market_data['bid_depth'] = sum([float(b[1]) for b in bids if len(b) > 1])
         
         # 3. 15분봉 캔들 기반 단기 미시구조 (ATR, VWAP, 아래꼬리 스윕)
-        klines_url = "https://api.bytick.com/v5/market/kline"
-        klines_params = {"category": "linear", "symbol": "BTCUSDT", "interval": "15", "limit": 14}
-        klines_res = requests.get(klines_url, headers=headers, params=klines_params, timeout=10).json()['result']['list']
-        klines = klines_res[::-1] 
+        klines_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=14"
+        klines_res = requests.get(klines_url, headers=headers, timeout=10).json().get('data', {})
+        
+        times = klines_res.get('time', [])
+        opens = klines_res.get('open', [])
+        highs = klines_res.get('high', [])
+        lows = klines_res.get('low', [])
+        closes = klines_res.get('close', [])
+        vols = klines_res.get('vol', [])
         
         tr_list = []
         typical_price_vol = 0
         total_vol = 0
         
-        for i in range(1, len(klines)):
-            high, low, close_prev = float(klines[i][2]), float(klines[i][3]), float(klines[i-1][4])
-            volume = float(klines[i][5])
-            tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
-            tr_list.append(tr)
+        if len(times) > 1:
+            for i in range(1, len(times)):
+                high = float(highs[i])
+                low = float(lows[i])
+                close_prev = float(closes[i-1])
+                close_curr = float(closes[i])
+                volume = float(vols[i])
+                
+                tr = max(high - low, abs(high - close_prev), abs(low - close_prev))
+                tr_list.append(tr)
+                
+                tp = (high + low + close_curr) / 3
+                typical_price_vol += tp * volume
+                total_vol += volume
+                
+            market_data['atr'] = sum(tr_list) / len(tr_list) if tr_list else 0
+            market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
             
-            tp = (high + low + float(klines[i][4])) / 3
-            typical_price_vol += tp * volume
-            total_vol += volume
+            # 마지막 캔들 스윕(아래꼬리) 여부 확인
+            last_open = float(opens[-1])
+            last_high = float(highs[-1])
+            last_low = float(lows[-1])
+            last_close = float(closes[-1])
             
-        market_data['atr'] = sum(tr_list) / len(tr_list) if tr_list else 0
-        market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
-        
-        # 마지막 캔들 스윕(아래꼬리) 여부 확인
-        last_open, last_high, last_low, last_close = map(float, [klines[-1][1], klines[-1][2], klines[-1][3], klines[-1][4]])
-        body = abs(last_close - last_open)
-        lower_wick = min(last_open, last_close) - last_low
-        if lower_wick > (body * 2):
-            market_data['is_sweep_candle'] = True
+            body = abs(last_close - last_open)
+            lower_wick = min(last_open, last_close) - last_low
+            if lower_wick > (body * 2):
+                market_data['is_sweep_candle'] = True
 
-        # 4. 스테이블코인 뱅크런 디페깅 확인 (USDC/USDT 현물 마켓 기준)
-        peg_url = "https://api.bytick.com/v5/market/tickers"
-        peg_params = {"category": "spot", "symbol": "USDCUSDT"}
-        peg_res = requests.get(peg_url, headers=headers, params=peg_params, timeout=10).json()['result']['list'][0]
-        market_data['stablecoin_peg'] = float(peg_res['lastPrice'])
+        # 4. 스테이블코인 뱅크런 디페깅 확인 (현물 마켓)
+        peg_url = "https://api.mexc.com/api/v3/ticker/price?symbol=USDCUSDT"
+        peg_res = requests.get(peg_url, headers=headers, timeout=10).json()
+        market_data['stablecoin_peg'] = float(peg_res.get('price', 1.0))
 
     except Exception as e:
-        print(f"시장 데이터 수집 중 에러 발생: {e}")
+        print(f"시장 데이터 수집 중 에러 발생 (MEXC): {e}")
         
     return market_data
 
@@ -245,7 +258,7 @@ def send_telegram_message(text):
 def main():
     print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작...")
     
-    # 1. API 데이터 실시간 수집 (CloudFront 방어벽 우회 도메인 사용)
+    # 1. API 데이터 실시간 수집 (북미 IP 차단 없는 MEXC로 완전 이주)
     market_data = fetch_market_data()
     onchain_data = fetch_onchain_data()
     
