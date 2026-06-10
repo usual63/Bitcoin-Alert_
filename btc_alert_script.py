@@ -13,7 +13,6 @@ def fetch_mvrv_zscore():
         
     headers = {'Authorization': f'Bearer {cq_api_key}'}
     try:
-        # 최신 데이터를 보장하기 위해 limit=3 호출 후 가장 마지막 배열(최신) 추출
         url = "https://api.cryptoquant.com/v1/btc/network-indicator/mvrv-zscore?limit=3"
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -75,7 +74,7 @@ def fetch_market_data():
             bids = depth_res.json().get('data', {}).get('bids', [])
             market_data['bid_depth'] = sum([float(b[1]) * 0.0001 for b in bids if len(b) > 1])
         
-        # 3. 15분봉 미시구조 (Anchored VWAP 적용을 위해 limit=100 확장)
+        # 3. 15분봉 미시구조
         klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
         k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
         if k15_res.status_code == 200:
@@ -87,16 +86,14 @@ def fetch_market_data():
                 typical_price_vol, total_vol = 0, 0
                 now_utc_date = datetime.utcnow().date()
                 
-                # 최근 14개 캔들의 ATR 및 Max TR 계산
                 recent_start_idx = max(1, len(closes) - 14)
                 for i in range(recent_start_idx, len(closes)):
                     high, low, close_prev = float(highs[i]), float(lows[i]), float(closes[i-1])
                     tr_list.append(max(high - low, abs(high - close_prev), abs(low - close_prev)))
                 
-                # 당일 자정 기준 Anchored VWAP 누적 연산
                 for i in range(1, len(closes)):
                     ts = float(times[i])
-                    if ts > 1e11: ts = ts / 1000 # ms to sec 환산
+                    if ts > 1e11: ts = ts / 1000
                     candle_date = datetime.utcfromtimestamp(ts).date()
                     if candle_date == now_utc_date:
                         high, low, close_curr, vol = float(highs[i]), float(lows[i]), float(closes[i]), float(vols[i])
@@ -112,7 +109,7 @@ def fetch_market_data():
                 if lower_wick > (body * 2) and lower_wick > (market_data['price'] * 0.002): 
                     market_data['is_sweep_candle'] = True
 
-        # 4. 4시간봉 매크로 지표 (Wilder's RMA 방식의 RSI 산출을 위해 limit=100 확장)
+        # 4. 4시간봉 매크로 지표
         klines_4h_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min240&limit=100"
         k4h_res = requests.get(klines_4h_url, headers=headers, timeout=10)
         if k4h_res.status_code == 200:
@@ -128,7 +125,6 @@ def fetch_market_data():
                 if vols_4h[-2] < (vol_ma20 * 0.5):
                     market_data['volume_exhaustion'] = True
                 
-                # 트레이딩뷰 표준 지수평활(RMA) RSI 계산
                 if len(closes_4h) >= 15:
                     diffs = [closes_4h[i] - closes_4h[i-1] for i in range(1, len(closes_4h))]
                     gains = [d if d > 0 else 0 for d in diffs]
@@ -177,9 +173,10 @@ def analyze_strategy(market):
     if market['price_to_ma20_ratio'] > 0.10: score += 20
     elif market['price_to_ma20_ratio'] > 0.05: score += 10
 
+    # 영점 보정: MEXC 유동성 환경에 맞춰 오더북 뎁스 붕괴 임계값을 100에서 20으로 하향 조정
     is_blackswan = False
     if market['stablecoin_peg'] < 0.985: is_blackswan = True
-    if market['bid_depth'] < 100: is_blackswan = True
+    if market['bid_depth'] < 20: is_blackswan = True
     if market['max_tr_15m'] > (market['price'] * 0.05): is_blackswan = True
 
     rescue_triggers = 0
@@ -195,7 +192,7 @@ def analyze_strategy(market):
     return 'A', score
 
 # =========================================================================
-# [3] 동적 텔레그램 메시지 발송 (HTML 파싱 모드 전면 적용)
+# [3] 동적 텔레그램 메시지 발송 (조건 누락 버그 픽스 완료)
 # =========================================================================
 
 def get_strategy_message(scenario_type, btc_price, score, market):
@@ -226,8 +223,24 @@ def get_strategy_message(scenario_type, btc_price, score, market):
     else: ma_stat = f"🟢 안전 (이평선 안착)"
 
     peg_stat = "🔴 위험 (디페깅)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
-    depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 100 else "🟢 안전"
+    # 출력 문자열 임계값도 20으로 동기화
+    depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 20 else "🟢 안전"
     atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
+
+    # DRY 모듈화: 모든 시나리오에서 고정적으로 출력될 현황 블록 구성
+    cond_a_block = f"""══════════════════════
+<b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
+• MVRV Z-스코어(20): {z_stat}
+• 공포 탐욕(20): {fgi_stat}
+• 파생 과열(20): {fr_stat}
+• 매크로 RSI(20): {rsi_stat}
+• 이평선 이격(20): {ma_stat}"""
+
+    cond_b_block = f"""══════════════════════
+<b>[조건 B: 블랙스완 킬 스위치 현황]</b>
+• 스테이블 뱅크런: {peg_stat}
+• 오더북 뎁스 붕괴: {depth_stat}
+• 청산맵/ATR 폭발: {atr_stat}"""
 
     if score >= 80:
         action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
@@ -242,25 +255,17 @@ def get_strategy_message(scenario_type, btc_price, score, market):
         action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
         header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
 
+    # 시나리오별 메시지 조립
     if scenario_type == 'A':
         return f"""<b>{header_title}</b>
 
 📈 타겟 자산: BTC (${btc_price:,.2f})
 ⚠️ 시장 과열 스코어: {score}점 / 100점
 
-══════════════════════
-<b>[조건 A: 온체인/파생/심리 복합 과열]</b>
-• MVRV Z-스코어(20): {z_stat}
-• 공포 탐욕(20): {fgi_stat}
-• 파생 과열(20): {fr_stat}
-• 매크로 RSI(20): {rsi_stat}
-• 이평선 이격(20): {ma_stat}
+{cond_a_block}
 
-══════════════════════
-<b>[조건 B: 블랙스완 킬 스위치 (대기 중)]</b>
-• 스테이블 뱅크런: {peg_stat}
-• 오더북 뎁스 붕괴: {depth_stat}
-• 청산맵/ATR 폭발: {atr_stat}
+{cond_b_block}
+➔ 판정: 🟢 안전 (조건 미달)
 
 💡 <b>시스템 판독 및 행동 지침</b>: 
 {action_advice}"""
@@ -271,11 +276,9 @@ def get_strategy_message(scenario_type, btc_price, score, market):
 📉 타겟 자산: BTC (${btc_price:,.2f})
 ⚠️ 킬 스위치 발동 (조건 A 점수 무시 및 강제 오버라이드)
 
-══════════════════════
-<b>[조건 B: 블랙스완 킬 스위치 트리거 현황]</b>
-• 스테이블 뱅크런: {peg_stat}
-• 오더북 뎁스 붕괴: {depth_stat}
-• 청산맵/ATR 폭발: {atr_stat}
+{cond_a_block}
+
+{cond_b_block}
 ➔ 판정: 🔴 대피 (시스템 장악)
 
 💡 <b>시스템 판독 및 행동 지침</b>:
@@ -287,9 +290,10 @@ def get_strategy_message(scenario_type, btc_price, score, market):
 🚀 타겟 자산: BTC (${btc_price:,.2f})
 ⏱️ 상태: 블랙스완 대피 이후 특이 현상(V자 랠리) 포착
 
-══════════════════════
-<b>[조건 C: V자 역발상 회복 (강제 재진입 승인)]</b>
-• 시장이 일시적 패닉을 흡수하고 강력한 매수세를 동반한 숏 스퀴즈가 발생했습니다.
+{cond_a_block}
+
+{cond_b_block}
+➔ 판정: 🟢 조건 C 충족 (강제 재진입 승인)
 
 💡 <b>시스템 판독 및 행동 지침</b>:
 세력의 유동성 사냥(Liquidity Sweep)이 종료되었습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
@@ -301,7 +305,6 @@ def send_telegram_message(text):
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id: return
     try:
-        # Markdown 크래시 방지를 위해 HTML 파싱 모드로 전면 교체
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
                       json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
     except: pass
