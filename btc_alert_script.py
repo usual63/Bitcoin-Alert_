@@ -57,7 +57,6 @@ def main():
         risk_score = 0
         details_A = {}
 
-        # ① 순유동성 (배점 15점)
         df_macro = pd.concat([walcl, wtregen, rrp], axis=1).ffill().dropna()
         df_macro.columns = ['WALCL', 'WTREGEN', 'RRP']
         df_macro['Net_Liq'] = df_macro['WALCL'] - df_macro['WTREGEN'] - (df_macro['RRP'] * 1000)
@@ -74,7 +73,6 @@ def main():
         else:
             details_A['유동성'] = "🟢 안전 (시중 유동성 정배열 확장)"
 
-        # ② 장단기 금리차 정상화 (배점 15점)
         current_spread = t10y2y.dropna().iloc[-1]
         if 0.0 < current_spread <= 0.5: 
             risk_score += 15
@@ -85,7 +83,6 @@ def main():
         else:
             details_A['금리차'] = "🟢 안전 (안정적 역전 또는 해소 상태)"
 
-        # ③ 시장 폭 하락 다이버전스 (배점 10점)
         sp500_50d_pct = yf.Ticker("^SP500-50").history(period="1y")
         mcclellan_div = False
         co_drop = False
@@ -106,7 +103,6 @@ def main():
         else:
             details_A['시장폭'] = "🟢 안전 (시장 전반 건강한 동반 상승)"
 
-        # ④ GMMA 그물망 차트 모멘텀 (배점 15점)
         short_min = pd.concat(short_emas, axis=1).min(axis=1).iloc[-1]
         short_max = pd.concat(short_emas, axis=1).max(axis=1).iloc[-1]
         long_min = pd.concat(long_emas, axis=1).min(axis=1).iloc[-1]
@@ -121,7 +117,6 @@ def main():
         else:
             details_A['GMMA'] = "🟢 안전 (단장기 그물망 간격 정배열)"
 
-        # ⑤ 샹들리에 엑시트 이탈도 (배점 15점)
         rolling_max = qqq['High'].rolling(22).max().iloc[-1]
         chandelier_val = rolling_max - (atr.iloc[-1] * 3.0)
         
@@ -134,7 +129,6 @@ def main():
         else:
             details_A['샹들리에'] = "🟢 안전 (하단 지지선과 넉넉한 이격)"
 
-        # ⑥ VIX 기간 구조 내재 위험 (배점 30점)
         vix_val = vix['Close'].iloc[-1]
         vix3m_val = vix3m['Close'].iloc[-1]
         vix_ratio = vix_val / vix3m_val
@@ -148,14 +142,14 @@ def main():
         else:
             details_A['VIX'] = "🟢 안전 (안정적인 정상 콘탱고 구조)"
 
-        # 5. 🌪️ [조건 B] 블랙스완 패닉 3중 필터 (단호한 이분법 유지) 🌪️
+        # 5. 🌪️ [조건 B] 블랙스완 패닉 3중 필터 🌪️
         vix_inversion = vix_val > vix3m_val
         chandelier_drop = latest_close < chandelier_val
         atr_explosion = atr.iloc[-1] > (1.5 * atr.rolling(20).mean().iloc[-1])
         
         trigger_B = vix_inversion and chandelier_drop and atr_explosion
 
-        # 6. 🚀 [우회 로직] V자 반등 (가짜 블랙스완) 3대 특이 현상 정밀 추적 🚀
+        # 6. 🚀 [우회 로직] V자 반등 (가짜 블랙스완) 감지 🚀
         vix_max_3d = vix['Close'].shift(1).rolling(3).max().iloc[-1]
         vix_crush = vix_val < (vix_max_3d * 0.80) if not pd.isna(vix_max_3d) else False
 
@@ -208,7 +202,6 @@ def main():
             f"➔ 판정: {'🔴 발동 (즉각 대피)' if (vix_inversion and chandelier_drop and atr_explosion) else '🟢 안전 (조건 미달)'}\n\n"
         )
 
-        # 🌟 블랙스완이 실제로 터졌을 때만 하단에 가변적으로 노출되는 특이현상 추적 UI
         if (vix_inversion and chandelier_drop and atr_explosion) or v_shape_recovery:
             alert_msg += (
                 f"══════════════════════\n"
