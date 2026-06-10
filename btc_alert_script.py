@@ -6,23 +6,27 @@ from datetime import datetime
 # [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed + CryptoQuant Free API)
 # =========================================================================
 
-def fetch_mvrv_zscore():
+def fetch_mvrv_indicator():
+    """
+    CryptoQuant 무료(Basic) 권한인 market-indicator/mvrv 엔드포인트를 활용합니다
+    GitHub Secrets에 'CQ_API_KEY' 등록 필수. 미등록 시 안전(1.0) 반환
+    """
     cq_api_key = os.environ.get("CQ_API_KEY", "")
     if not cq_api_key:
         return 1.0 
         
     headers = {'Authorization': f'Bearer {cq_api_key}'}
     try:
-        url = "https://api.cryptoquant.com/v1/btc/network-indicator/mvrv-zscore?limit=3"
+        url = "https://api.cryptoquant.com/v1/btc/market-indicator/mvrv?limit=3"
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json().get('result', {}).get('data', [])
             if data:
-                return float(data[-1].get('mvrv_zscore', 1.0))
+                return float(data[-1].get('mvrv', 1.0))
         else:
-            print(f"MVRV 수집 에러 (Status {res.status_code}): API 한도 초과 또는 권한 없음")
+            print(f"MVRV 수집 에러 (Status {res.status_code}): API 권한 또는 파라미터 확인 필요")
     except Exception as e:
-        print(f"MVRV Z-Score 통신 에러: {e}")
+        print(f"MVRV 통신 에러: {e}")
     return 1.0
 
 def fetch_fear_and_greed_index():
@@ -57,9 +61,9 @@ def fetch_market_data():
     
     try:
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
-        market_data['mvrv_z'] = fetch_mvrv_zscore()
+        market_data['mvrv_z'] = fetch_mvrv_indicator()
         
-        # 1. 가격 및 펀딩비
+        # 1. 가격 및 펀딩비 (MEXC 선물)
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
         if res_ticker.status_code == 200:
@@ -74,7 +78,7 @@ def fetch_market_data():
             bids = depth_res.json().get('data', {}).get('bids', [])
             market_data['bid_depth'] = sum([float(b[1]) * 0.0001 for b in bids if len(b) > 1])
         
-        # 3. 15분봉 미시구조
+        # 3. 15분봉 미시구조 (Anchored VWAP 포함)
         klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
         k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
         if k15_res.status_code == 200:
@@ -109,8 +113,8 @@ def fetch_market_data():
                 if lower_wick > (body * 2) and lower_wick > (market_data['price'] * 0.002): 
                     market_data['is_sweep_candle'] = True
 
-        # 4. 4시간봉 매크로 지표
-        klines_4h_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min240&limit=100"
+        # 4. 4시간봉 매크로 기술 지표 (RMA 방식 RSI)
+        klines_4h_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Hour4&limit=100"
         k4h_res = requests.get(klines_4h_url, headers=headers, timeout=10)
         if k4h_res.status_code == 200:
             k4h_data = k4h_res.json().get('data', {})
@@ -173,7 +177,6 @@ def analyze_strategy(market):
     if market['price_to_ma20_ratio'] > 0.10: score += 20
     elif market['price_to_ma20_ratio'] > 0.05: score += 10
 
-    # 영점 보정: MEXC 유동성 환경에 맞춰 오더북 뎁스 붕괴 임계값을 100에서 20으로 하향 조정
     is_blackswan = False
     if market['stablecoin_peg'] < 0.985: is_blackswan = True
     if market['bid_depth'] < 20: is_blackswan = True
@@ -192,15 +195,15 @@ def analyze_strategy(market):
     return 'A', score
 
 # =========================================================================
-# [3] 동적 텔레그램 메시지 발송 (조건 누락 버그 픽스 완료)
+# [3] 동적 텔레그램 메시지 발송
 # =========================================================================
 
 def get_strategy_message(scenario_type, btc_price, score, market):
     
     z = market['mvrv_z']
-    if z >= 3.0: z_stat = f"🔴 위험 (Z-Score {z:.2f} 역사적 과열권)"
-    elif z >= 2.0: z_stat = f"🟠 경고 (Z-Score {z:.2f} 강세장 후반부)"
-    else: z_stat = f"🟢 안전 (Z-Score {z:.2f} 정상 궤도)"
+    if z >= 3.0: z_stat = f"🔴 위험 (MVRV {z:.2f} 역사적 과열권)"
+    elif z >= 2.0: z_stat = f"🟠 경고 (MVRV {z:.2f} 강세장 후반부)"
+    else: z_stat = f"🟢 안전 (MVRV {z:.2f} 정상 궤도)"
     
     fgi = market['fear_greed_index']
     if fgi >= 85: fgi_stat = f"🔴 위험 (극단적 탐욕 {fgi})"
@@ -223,14 +226,12 @@ def get_strategy_message(scenario_type, btc_price, score, market):
     else: ma_stat = f"🟢 안전 (이평선 안착)"
 
     peg_stat = "🔴 위험 (디페깅)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
-    # 출력 문자열 임계값도 20으로 동기화
     depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 20 else "🟢 안전"
     atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
 
-    # DRY 모듈화: 모든 시나리오에서 고정적으로 출력될 현황 블록 구성
     cond_a_block = f"""══════════════════════
 <b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
-• MVRV Z-스코어(20): {z_stat}
+• MVRV 인덱스(20): {z_stat}
 • 공포 탐욕(20): {fgi_stat}
 • 파생 과열(20): {fr_stat}
 • 매크로 RSI(20): {rsi_stat}
@@ -255,7 +256,6 @@ def get_strategy_message(scenario_type, btc_price, score, market):
         action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
         header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
 
-    # 시나리오별 메시지 조립
     if scenario_type == 'A':
         return f"""<b>{header_title}</b>
 
