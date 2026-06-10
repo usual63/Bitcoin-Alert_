@@ -1,310 +1,230 @@
 import os
 import requests
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from fredapi import Fred
 
-# =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed)
-# 외부 온체인 API(크립토퀀트) 완전 제거 및 거래소 데이터 100% 자립화
-# =========================================================================
+# ---------------------------------------------------------
+# [기본 통신 및 헬퍼 함수]
+# ---------------------------------------------------------
+def send_telegram_message(text):
+    bot_token = os.environ.get('TELEGRAM_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not bot_token or not chat_id:
+        print("🚨 오류: 텔레그램 토큰이나 챗봇 ID가 누락되었습니다")
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    requests.post(url, data={'chat_id': chat_id, 'text': text})
 
-def fetch_fear_and_greed_index():
+def calculate_atr(df, period=22):
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    return np.max(ranges, axis=1).rolling(period).mean()
+
+# ---------------------------------------------------------
+# [메인 알고리즘 실행부]
+# ---------------------------------------------------------
+def main():
     try:
-        res = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-        if res.status_code == 200:
-            return int(res.json()['data'][0]['value'])
-    except: pass
-    return 50
+        # 1. API 키 로드
+        fred_key = os.environ.get('FRED_API_KEY')
+        if not fred_key:
+            print("🚨 오류: FRED API 키가 존재하지 않습니다")
+            return
+        fred = Fred(api_key=fred_key)
 
-def fetch_market_data():
-    market_data = {
-        'price': 0.0,
-        'funding_rate_annual': 0.0,
-        'bid_depth': 0.0,
-        'atr_15m_avg': 0.0,
-        'max_tr_15m': 0.0, 
-        'vwap': 0.0,
-        'is_sweep_candle': False,
-        'stablecoin_peg': 1.0,
-        'rsi_1d': 50.0,             # 1D로 격상
-        'price_to_ma20_ratio': 0.0, # 1D MA20 기준
-        'mayer_multiple': 1.0,      # 자체 연산 메이어 배수 추가
-        'fear_greed_index': 50
-    }
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-    }
-    
-    try:
-        market_data['fear_greed_index'] = fetch_fear_and_greed_index()
+        # 2. 시장 및 매크로 데이터 수집
+        qqq = yf.Ticker("QQQ").history(period="1y")
+        vix = yf.Ticker("^VIX").history(period="1y")
+        vix3m = yf.Ticker("^VIX3M").history(period="1y")
         
-        # 1. 가격 및 펀딩비 (MEXC 실시간)
-        ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
-        res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
-        if res_ticker.status_code == 200:
-            ticker_data = res_ticker.json().get('data', {})
-            market_data['price'] = float(ticker_data.get('lastPrice', 0))
-            market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
+        walcl = fred.get_series('WALCL') 
+        wtregen = fred.get_series('WTREGEN') 
+        rrp = fred.get_series('RRPONTSYD') 
+        t10y2y = fred.get_series('T10Y2Y') 
         
-        # 2. 오더북 뎁스 (MEXC 실시간)
-        depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
-        depth_res = requests.get(depth_url, headers=headers, timeout=10)
-        if depth_res.status_code == 200:
-            bids = depth_res.json().get('data', {}).get('bids', [])
-            market_data['bid_depth'] = sum([float(b[1]) * 0.0001 for b in bids if len(b) > 1])
+        latest_close = qqq['Close'].iloc[-1]
+
+        # 3. 공통 기술적 지표 사전 산출
+        atr = calculate_atr(qqq, 22)
+        short_emas = [qqq['Close'].ewm(span=p, adjust=False).mean() for p in [3, 5, 8, 10, 12, 15]]
+        long_emas = [qqq['Close'].ewm(span=p, adjust=False).mean() for p in [30, 35, 40, 45, 50, 60]]
         
-        # 3. 15분봉 미시구조 (블랙스완 및 구조대 판독기)
-        klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
-        k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
-        if k15_res.status_code == 200:
-            k15_data = k15_res.json().get('data', {})
-            closes = k15_data.get('close', [])
-            if len(closes) > 2:
-                times, opens, highs, lows, vols = k15_data['time'], k15_data['open'], k15_data['high'], k15_data['low'], k15_data['vol']
-                tr_list = []
-                typical_price_vol, total_vol = 0, 0
-                now_utc_date = datetime.utcnow().date()
-                
-                recent_start_idx = max(1, len(closes) - 14)
-                for i in range(recent_start_idx, len(closes)):
-                    high, low, close_prev = float(highs[i]), float(lows[i]), float(closes[i-1])
-                    tr_list.append(max(high - low, abs(high - close_prev), abs(low - close_prev)))
-                
-                for i in range(1, len(closes)):
-                    ts = float(times[i])
-                    if ts > 1e11: ts = ts / 1000
-                    candle_date = datetime.utcfromtimestamp(ts).date()
-                    if candle_date == now_utc_date:
-                        high, low, close_curr, vol = float(highs[i]), float(lows[i]), float(closes[i]), float(vols[i])
-                        typical_price_vol += ((high + low + close_curr) / 3) * vol
-                        total_vol += vol
-                        
-                market_data['atr_15m_avg'] = sum(tr_list) / len(tr_list) if tr_list else 0
-                market_data['max_tr_15m'] = max(tr_list) if tr_list else 0
-                market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
-                
-                body = abs(float(closes[-2]) - float(opens[-2]))
-                lower_wick = min(float(opens[-2]), float(closes[-2])) - float(lows[-2])
-                if lower_wick > (body * 2) and lower_wick > (market_data['price'] * 0.002): 
-                    market_data['is_sweep_candle'] = True
+        # 4. 🌟 [조건 A] 100점 만점 3단계(3-Tier) 세분화 스코어링 🌟
+        risk_score = 0
+        details_A = {}
 
-        # 4. 일봉(1D) 매크로 지표 (Mayer Multiple, 1D RSI, 1D MA20 전면 격상)
-        klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=250"
-        k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
-        if k1d_res.status_code == 200:
-            k1d_data = k1d_res.json().get('data', {})
-            closes_1d = [float(c) for c in k1d_data.get('close', [])]
-            
-            # 메이어 배수 연산 (현재가 / 200일 이동평균선)
-            if len(closes_1d) >= 200:
-                ma200 = sum(closes_1d[-200:]) / 200
-                market_data['mayer_multiple'] = market_data['price'] / ma200 if ma200 > 0 else 1.0
+        # ① 순유동성 (배점 15점)
+        df_macro = pd.concat([walcl, wtregen, rrp], axis=1).ffill().dropna()
+        df_macro.columns = ['WALCL', 'WTREGEN', 'RRP']
+        df_macro['Net_Liq'] = df_macro['WALCL'] - df_macro['WTREGEN'] - (df_macro['RRP'] * 1000)
+        liq_20ma = df_macro['Net_Liq'].rolling(20).mean().iloc[-1]
+        liq_50ma = df_macro['Net_Liq'].rolling(50).mean().iloc[-1]
+        liq_spread = (liq_20ma - liq_50ma) / liq_50ma
+        
+        if liq_spread < 0: 
+            risk_score += 15
+            details_A['유동성'] = "🔴 위험 (데드크로스 본격화)"
+        elif 0 <= liq_spread <= 0.01:
+            risk_score += 7
+            details_A['유동성'] = "🟡 경고 (자금 유입 모멘텀 둔화)"
+        else:
+            details_A['유동성'] = "🟢 안전 (시중 유동성 정배열 확장)"
 
-            if len(closes_1d) >= 20:
-                ma20 = sum(closes_1d[-20:]) / 20
-                market_data['price_to_ma20_ratio'] = (market_data['price'] - ma20) / ma20
+        # ② 장단기 금리차 정상화 (배점 15점)
+        current_spread = t10y2y.dropna().iloc[-1]
+        if 0.0 < current_spread <= 0.5: 
+            risk_score += 15
+            details_A['금리차'] = "🔴 위험 (0선 상향突破 침체 진입)"
+        elif -0.2 <= current_spread <= 0.0:
+            risk_score += 7
+            details_A['금리차'] = "🟡 경고 (역전해소 임박 급격한 축소)"
+        else:
+            details_A['금리차'] = "🟢 안전 (안정적 역전 또는 해소 상태)"
+
+        # ③ 시장 폭 하락 다이버전스 (배점 10점)
+        sp500_50d_pct = yf.Ticker("^SP500-50").history(period="1y")
+        mcclellan_div = False
+        co_drop = False
+        if not sp500_50d_pct.empty:
+            qqq_growth = qqq['Close'].iloc[-1] > qqq['Close'].shift(20).iloc[-1]
+            sp_growth = sp500_50d_pct['Close'].iloc[-1] > sp500_50d_pct['Close'].shift(20).iloc[-1]
+            if qqq_growth and not sp_growth:
+                mcclellan_div = True
+            elif not qqq_growth and not sp_growth:
+                co_drop = True
                 
-                # 트레이딩뷰 표준 지수평활(RMA) 기반 일봉 RSI 
-                if len(closes_1d) >= 15:
-                    diffs = [closes_1d[i] - closes_1d[i-1] for i in range(1, len(closes_1d))]
-                    gains = [d if d > 0 else 0 for d in diffs]
-                    losses = [abs(d) if d < 0 else 0 for d in diffs]
-                    
-                    avg_gain = sum(gains[:14]) / 14
-                    avg_loss = sum(losses[:14]) / 14
-                    
-                    for i in range(14, len(diffs)):
-                        avg_gain = (avg_gain * 13 + gains[i]) / 14
-                        avg_loss = (avg_loss * 13 + losses[i]) / 14
-                        
-                    if avg_loss == 0: market_data['rsi_1d'] = 100.0
-                    else: market_data['rsi_1d'] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+        if mcclellan_div: 
+            risk_score += 10
+            details_A['시장폭'] = "🔴 위험 (소수 독점 하락 다이버전스)"
+        elif co_drop:
+            risk_score += 5
+            details_A['시장폭'] = "🟡 경고 (시장 전체 동반 조정 국면)"
+        else:
+            details_A['시장폭'] = "🟢 안전 (시장 전반 건강한 동반 상승)"
 
-        # 5. 스테이블코인 페깅
-        peg_url = "https://api.mexc.com/api/v3/ticker/price?symbol=USDCUSDT"
-        peg_res = requests.get(peg_url, headers=headers, timeout=10)
-        if peg_res.status_code == 200:
-            market_data['stablecoin_peg'] = float(peg_res.json().get('price', 1.0))
+        # ④ GMMA 그물망 차트 모멘텀 (배점 15점)
+        short_min = pd.concat(short_emas, axis=1).min(axis=1).iloc[-1]
+        short_max = pd.concat(short_emas, axis=1).max(axis=1).iloc[-1]
+        long_min = pd.concat(long_emas, axis=1).min(axis=1).iloc[-1]
+        long_max = pd.concat(long_emas, axis=1).max(axis=1).iloc[-1]
+        
+        if short_max < long_min: 
+            risk_score += 15
+            details_A['GMMA'] = "🔴 위험 (그물망 하향 돌파 역배열)"
+        elif short_min <= long_max:
+            risk_score += 7
+            details_A['GMMA'] = "🟡 경고 (이평선 응축 그물망 꼬임)"
+        else:
+            details_A['GMMA'] = "🟢 안전 (단장기 그물망 간격 정배열)"
+
+        # ⑤ 샹들리에 엑시트 이탈도 (배점 15점)
+        rolling_max = qqq['High'].rolling(22).max().iloc[-1]
+        chandelier_val = rolling_max - (atr.iloc[-1] * 3.0)
+        
+        if latest_close < chandelier_val: 
+            risk_score += 15
+            details_A['샹들리에'] = "🔴 위험 (중기 핵심 지지선 하향 이탈)"
+        elif chandelier_val <= latest_close <= (chandelier_val + atr.iloc[-1]):
+            risk_score += 7
+            details_A['샹들리에'] = "🟡 경고 (지지선 턱밑 리스크 근접)"
+        else:
+            details_A['샹들리에'] = "🟢 안전 (하단 지지선과 넉넉한 이격)"
+
+        # ⑥ VIX 기간 구조 내재 위험 (배점 30점)
+        vix_val = vix['Close'].iloc[-1]
+        vix3m_val = vix3m['Close'].iloc[-1]
+        vix_ratio = vix_val / vix3m_val
+        
+        if vix_ratio > 1.0: 
+            risk_score += 30
+            details_A['VIX'] = "🔴 위험 (단기 불안 백워데이션 역전)"
+        elif 0.9 <= vix_ratio <= 1.0:
+            risk_score += 15
+            details_A['VIX'] = "🟡 경고 (공포 확산 콘탱고 폭 둔화)"
+        else:
+            details_A['VIX'] = "🟢 안전 (안정적인 정상 콘탱고 구조)"
+
+        # 5. 🌪️ [조건 B] 블랙스완 패닉 3중 필터 (단호한 이분법 유지) 🌪️
+        vix_inversion = vix_val > vix3m_val
+        chandelier_drop = latest_close < chandelier_val
+        atr_explosion = atr.iloc[-1] > (1.5 * atr.rolling(20).mean().iloc[-1])
+        
+        trigger_B = vix_inversion and chandelier_drop and atr_explosion
+
+        # 6. 🚀 [우회 로직] V자 반등 (가짜 블랙스완) 3대 특이 현상 정밀 추적 🚀
+        vix_max_3d = vix['Close'].shift(1).rolling(3).max().iloc[-1]
+        vix_crush = vix_val < (vix_max_3d * 0.80) if not pd.isna(vix_max_3d) else False
+
+        daily_range = qqq['High'].iloc[-1] - qqq['Low'].iloc[-1]
+        lower_tail = min(qqq['Open'].iloc[-1], latest_close) - qqq['Low'].iloc[-1]
+        tail_ratio = lower_tail / daily_range if daily_range > 0 else 0
+        volume_tail_absorb = (tail_ratio > 0.40) and (qqq['Volume'].iloc[-1] > (qqq['Volume'].rolling(20).mean().iloc[-1] * 1.2))
+
+        short_spread = pd.concat(short_emas, axis=1).max(axis=1) - pd.concat(short_emas, axis=1).min(axis=1)
+        gmma_compression = (short_spread.iloc[-1] < short_spread.iloc[-2]) and (latest_close > qqq['Close'].rolling(5).mean().iloc[-1])
+
+        v_shape_recovery = (int(vix_crush) + int(volume_tail_absorb) + int(gmma_compression)) >= 2
+
+        # 7. ⚖️ 마스터 시스템 상태 판별 및 우선순위 제어 ⚖️
+        if v_shape_recovery:
+            status_icon = "🚀 [고속 재진입]"
+            action_msg = "V자 반등(가짜 블랙스완) 특이 현상이 확정되었습니다. 손절 국면을 완전히 마감하고 QQQ 및 레버리지 포지션의 즉각적인 전량 재매수를 강력 권장합니다."
+            trigger_B = False  
+        elif trigger_B or risk_score >= 80:
+            status_icon = "🚨 [강력 매도]"
+            action_msg = "조건 A(구조적 붕괴) 또는 조건 B(블랙스완)가 충족되었습니다. 전량 현금화 및 포트폴리오 대피를 즉시 권장합니다."
+        elif risk_score >= 60:
+            status_icon = "🟠 [비중 축소]"
+            action_msg = "거시 환경이 악화 중입니다. 신규 매수를 전면 중단하고 위험 자산 비중의 단계적 축소를 권장합니다."
+        elif risk_score >= 35:
+            status_icon = "🟡 [사전 경고]"
+            action_msg = "일부 지표에서 리스크가 감지되었습니다. 시장 변동성 모니터링 및 리스크 관리를 강화하세요."
+        else:
+            status_icon = "🟢 [Buy & Hold]"
+            action_msg = "안전 장세입니다. 레버리지 및 코어 자산 포지션을 우상향 복리 스노우볼 방향으로 그대로 유지합니다."
+
+        # 8. 📝 직관적 가독성 최적화 기반 메시지 조립
+        alert_msg = (
+            f"{status_icon} 데일리 퀀트 위험도 분석\n\n"
+            f"📈 타겟 자산: QQQ (${latest_close:.2f})\n"
+            f"⚠️ 시장 붕괴 스코어: {risk_score}점 / 100점\n\n"
+            f"══════════════════════\n"
+            f"**[조건 A: 구조적 붕괴 (80점 이상 매도)]**\n"
+            f"• 유동성(15): {details_A['유동성']}\n"
+            f"• 금리차(15): {details_A['금리차']}\n"
+            f"• 시장폭(10): {details_A['시장폭']}\n"
+            f"• GMMA(15): {details_A['GMMA']}\n"
+            f"• 샹들리에(15): {details_A['샹들리에']}\n"
+            f"• VIX역전(30): {details_A['VIX']}\n\n"
+            f"══════════════════════\n"
+            f"**[조건 B: 블랙스완 (3개 동시 충족 시 대피)]**\n"
+            f"• 패닉 투심(VIX): {'🔴 위험 (단기 역전)' if vix_inversion else '🟢 안전'}\n"
+            f"• 추세 붕괴(Price): {'🔴 위험 (지지선 이탈)' if chandelier_drop else '🟢 안전'}\n"
+            f"• 변동성 폭발(ATR): {'🔴 위험 (당일 ' + str(round(atr_val,1)) + ')' if atr_explosion else '🟢 안전'}\n"
+            f"➔ 판정: {'🔴 발동 (즉각 대피)' if (vix_inversion and chandelier_drop and atr_explosion) else '🟢 안전 (조건 미달)'}\n\n"
+        )
+
+        # 🌟 블랙스완이 실제로 터졌을 때만 하단에 가변적으로 노출되는 특이현상 추적 UI
+        if (vix_inversion and chandelier_drop and atr_explosion) or v_shape_recovery:
+            alert_msg += (
+                f"══════════════════════\n"
+                f"**[특이 현상: V자 반등 (가짜 블랙스완) 추적]**\n"
+                f"• VIX 크러시: {'🟢 포착 (공포 급감)' if vix_crush else '⚪ 대기 (공포 지속)'}\n"
+                f"• 투매 흡수: {'🟢 포착 (아래꼬리)' if volume_tail_absorb else '⚪ 대기 (매수세 부족)'}\n"
+                f"• 단기망 압축: {'🟢 포착 (그물망 꺾임)' if gmma_compression else '⚪ 대기 (추세 하락)'}\n"
+                f"➔ 판정: {'🚀 반등 확정 (즉시 복구)' if v_shape_recovery else '⏳ 징후 추적 중 (관망 유지)'}\n\n"
+            )
+
+        alert_msg += f"💡 **시스템 판독**: {action_msg}"
+
+        send_telegram_message(alert_msg)
 
     except Exception as e:
-        print(f"시장 데이터 수집 에러: {e}")
-        
-    return market_data
-
-# =========================================================================
-# [2] 하이브리드 전략 엔진
-# =========================================================================
-
-def analyze_strategy(market):
-    score = 0
-    
-    # 1. 일봉 메이어 배수 (역사적 고점 2.4, 강세장 1.5 기준)
-    if market['mayer_multiple'] >= 2.0: score += 20
-    elif market['mayer_multiple'] >= 1.5: score += 10
-    
-    # 2. 공포 탐욕 지수
-    if market['fear_greed_index'] >= 85: score += 20
-    elif market['fear_greed_index'] >= 75: score += 10
-    
-    # 3. 파생 펀딩비 과열
-    if market['funding_rate_annual'] > 50.0: score += 20
-    elif market['funding_rate_annual'] > 20.0: score += 10
-    
-    # 4. 일봉 매크로 RSI (1D 기준)
-    if market['rsi_1d'] > 80.0: score += 20
-    elif market['rsi_1d'] > 70.0: score += 10
-    
-    # 5. 일봉 이평선 이격도 (1D 밴드에 맞게 임계값 상향)
-    if market['price_to_ma20_ratio'] > 0.20: score += 20 # 20% 이상 이격
-    elif market['price_to_ma20_ratio'] > 0.10: score += 10 # 10% 이상 이격
-
-    is_blackswan = False
-    if market['stablecoin_peg'] < 0.985: is_blackswan = True
-    if market['bid_depth'] < 20: is_blackswan = True
-    if market['max_tr_15m'] > (market['price'] * 0.05): is_blackswan = True
-
-    rescue_triggers = 0
-    if market['funding_rate_annual'] < -50.0: rescue_triggers += 1
-    if market['is_sweep_candle']: rescue_triggers += 1
-    if market['price'] > market['vwap']: rescue_triggers += 1
-    
-    is_rescue = (rescue_triggers >= 2)
-
-    if is_blackswan:
-        if is_rescue: return 'C', score
-        return 'B', score
-    return 'A', score
-
-# =========================================================================
-# [3] 동적 텔레그램 메시지 발송
-# =========================================================================
-
-def get_strategy_message(scenario_type, btc_price, score, market):
-    
-    mm = market['mayer_multiple']
-    if mm >= 2.0: mm_stat = f"🔴 위험 (메이어 배수 {mm:.2f} 역사적 고점)"
-    elif mm >= 1.5: mm_stat = f"🟠 경고 (메이어 배수 {mm:.2f} 강세장 확장)"
-    else: mm_stat = f"🟢 안전 (메이어 배수 {mm:.2f} 정상 궤도)"
-    
-    fgi = market['fear_greed_index']
-    if fgi >= 85: fgi_stat = f"🔴 위험 (극단적 탐욕 {fgi})"
-    elif fgi >= 75: fgi_stat = f"🟠 경고 (탐욕 진입 {fgi})"
-    else: fgi_stat = f"🟢 안전 (중립 또는 공포 {fgi})"
-
-    fr = market['funding_rate_annual']
-    if fr > 50.0: fr_stat = f"🔴 위험 (연환산 {fr:.1f}% 과열)"
-    elif fr > 20.0: fr_stat = f"🟠 경고 (연환산 {fr:.1f}% 누적)"
-    else: fr_stat = f"🟢 안전 (정상 펀딩비)"
-
-    rsi = market['rsi_1d']
-    if rsi > 80.0: rsi_stat = f"🔴 위험 (1D RSI {rsi:.1f} 한계)"
-    elif rsi > 70.0: rsi_stat = f"🟠 경고 (1D RSI {rsi:.1f} 과매수)"
-    else: rsi_stat = f"🟢 안전 (1D RSI {rsi:.1f} 안정권)"
-
-    ma_ratio = market['price_to_ma20_ratio'] * 100
-    if ma_ratio > 20.0: ma_stat = f"🔴 위험 (1D MA20 대비 +{ma_ratio:.1f}% 폭등)"
-    elif ma_ratio > 10.0: ma_stat = f"🟡 주의 (1D MA20 이격 상승)"
-    else: ma_stat = f"🟢 안전 (이평선 안착)"
-
-    peg_stat = "🔴 위험 (디페깅)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
-    depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 20 else "🟢 안전"
-    atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
-
-    cond_a_block = f"""══════════════════════
-<b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
-• 매크로 메이어(20): {mm_stat}
-• 공포 탐욕(20): {fgi_stat}
-• 파생 과열(20): {fr_stat}
-• 매크로 RSI(20): {rsi_stat}
-• 이평선 이격(20): {ma_stat}"""
-
-    cond_b_block = f"""══════════════════════
-<b>[조건 B: 블랙스완 킬 스위치 현황]</b>
-• 스테이블 뱅크런: {peg_stat}
-• 오더북 뎁스 붕괴: {depth_stat}
-• 청산맵/ATR 폭발: {atr_stat}"""
-
-    if score >= 80:
-        action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
-        header_title = "🚨 [전량 매도] 비트코인 하이브리드 위험도 분석"
-    elif score >= 50:
-        action_advice = "시장의 쏠림과 구조적 과열이 강합니다. 알트코인 전량 매도 및 비트코인 50% 분할 익절을 권장합니다."
-        header_title = "🔴 [강력 경고] 비트코인 하이브리드 위험도 분석"
-    elif score >= 30:
-        action_advice = "과열 징후가 포착되었습니다. 신규 진입을 중단하고 레버리지를 축소하십시오."
-        header_title = "🟠 [비중 축소] 비트코인 하이브리드 위험도 분석"
-    else:
-        action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
-        header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
-
-    if scenario_type == 'A':
-        return f"""<b>{header_title}</b>
-
-📈 타겟 자산: BTC (${btc_price:,.2f})
-⚠️ 시장 과열 스코어: {score}점 / 100점
-
-{cond_a_block}
-
-{cond_b_block}
-➔ 판정: 🟢 안전 (조건 미달)
-
-💡 <b>시스템 판독 및 행동 지침</b>: 
-{action_advice}"""
-
-    elif scenario_type == 'B':
-        return f"""<b>🚨 [시스템 마비] 비트코인 블랙스완 킬 스위치 발동</b>
-
-📉 타겟 자산: BTC (${btc_price:,.2f})
-⚠️ 킬 스위치 발동 (조건 A 점수 무시 및 강제 오버라이드)
-
-{cond_a_block}
-
-{cond_b_block}
-➔ 판정: 🔴 대피 (시스템 장악)
-
-💡 <b>시스템 판독 및 행동 지침</b>:
-시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다. 스코어와 무관하게 즉시 모든 레버리지 및 현물을 전량 매도하고 대피하십시오."""
-
-    elif scenario_type == 'C':
-        return f"""<b>🟢 [초고속 재진입] 비트코인 숏 스퀴즈 구조대 발동</b>
-
-🚀 타겟 자산: BTC (${btc_price:,.2f})
-⏱️ 상태: 블랙스완 대피 이후 특이 현상(V자 랠리) 포착
-
-{cond_a_block}
-
-{cond_b_block}
-➔ 판정: 🟢 조건 C 충족 (강제 재진입 승인)
-
-💡 <b>시스템 판독 및 행동 지침</b>:
-세력의 유동성 사냥(Liquidity Sweep)이 종료되었습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
-    
-    return "전략 오류"
-
-def send_telegram_message(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return
-    try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                      json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except: pass
-
-def main():
-    print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Independent Macro Edition)...")
-    market_data = fetch_market_data()
-    btc_current_price = market_data.get('price', 0.0)
-    
-    if btc_current_price == 0.0:
-        print("API 통신 지연으로 가격을 불러오지 못했습니다. 에러 알림을 전송합니다.")
-        send_telegram_message("<b>🚨 [시스템 에러]</b> API 통신 장애 발생. 봇이 데이터를 불러오지 못했습니다. 거래소 API 상태를 확인하십시오.")
-        return
-        
-    scenario, total_score = analyze_strategy(market_data)
-    alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data)
-    send_telegram_message(alert_message)
-    print("시스템 스캔 및 프로세스 종료")
+        send_telegram_message(f"🚨 퀀트 시스템 런타임 에러 발생: {e}")
 
 if __name__ == "__main__":
     main()
