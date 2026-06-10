@@ -28,7 +28,7 @@ def fetch_market_data():
         'price_to_ma20_ratio': 0.0,
         'volume_exhaustion': False, 
         'fear_greed_index': 50,
-        'mayer_multiple': 1.0  # MVRV를 대체하는 100% 무료 자체 연산 매크로 지표
+        'mayer_multiple': 1.0
     }
     
     headers = {
@@ -120,7 +120,7 @@ def fetch_market_data():
                     if avg_loss == 0: market_data['rsi_4h'] = 100.0
                     else: market_data['rsi_4h'] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
 
-        # 5. 일봉(1Day) 메이어 배수 연산 (MVRV 완벽 대체 100% 무료 엔진)
+        # 5. 일봉(1Day) 메이어 배수 연산
         klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=200"
         k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
         if k1d_res.status_code == 200:
@@ -148,7 +148,6 @@ def fetch_market_data():
 def analyze_strategy(market):
     score = 0
     
-    # MVRV를 메이어 배수(Mayer Multiple)로 완벽 대체
     if market['mayer_multiple'] >= 2.4: score += 20
     elif market['mayer_multiple'] >= 2.0: score += 10
     
@@ -187,7 +186,6 @@ def analyze_strategy(market):
 
 def get_strategy_message(scenario_type, btc_price, score, market):
     
-    # 동적 상태 문자열 매핑 (MVRV -> 메이어 배수 교체)
     mm = market['mayer_multiple']
     if mm >= 2.4: mm_stat = f"🔴 위험 (메이어 배수 {mm:.2f} 역사적 과열)"
     elif mm >= 2.0: mm_stat = f"🟠 경고 (메이어 배수 {mm:.2f} 강세장 과열)"
@@ -222,4 +220,95 @@ def get_strategy_message(scenario_type, btc_price, score, market):
 • 매크로 메이어(20): {mm_stat}
 • 공포 탐욕(20): {fgi_stat}
 • 파생 과열(20): {fr_stat}
-• 매
+• 매크로 RSI(20): {rsi_stat}
+• 이평선 이격(20): {ma_stat}"""
+
+    cond_b_block = f"""══════════════════════
+<b>[조건 B: 블랙스완 킬 스위치 현황]</b>
+• 스테이블 뱅크런: {peg_stat}
+• 오더북 뎁스 붕괴: {depth_stat}
+• 청산맵/ATR 폭발: {atr_stat}"""
+
+    if score >= 80:
+        action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
+        header_title = "🚨 [전량 매도] 비트코인 하이브리드 위험도 분석"
+    elif score >= 50:
+        action_advice = "시장의 쏠림과 구조적 과열이 강합니다. 알트코인 전량 매도 및 비트코인 50% 분할 익절을 권장합니다."
+        header_title = "🔴 [강력 경고] 비트코인 하이브리드 위험도 분석"
+    elif score >= 30:
+        action_advice = "과열 징후가 포착되었습니다. 신규 진입을 중단하고 레버리지를 축소하십시오."
+        header_title = "🟠 [비중 축소] 비트코인 하이브리드 위험도 분석"
+    else:
+        action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
+        header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
+
+    if scenario_type == 'A':
+        return f"""<b>{header_title}</b>
+
+📈 타겟 자산: BTC (${btc_price:,.2f})
+⚠️ 시장 과열 스코어: {score}점 / 100점
+
+{cond_a_block}
+
+{cond_b_block}
+➔ 판정: 🟢 안전 (조건 미달)
+
+💡 <b>시스템 판독 및 행동 지침</b>: 
+{action_advice}"""
+
+    elif scenario_type == 'B':
+        return f"""<b>🚨 [시스템 마비] 비트코인 블랙스완 킬 스위치 발동</b>
+
+📉 타겟 자산: BTC (${btc_price:,.2f})
+⚠️ 킬 스위치 발동 (조건 A 점수 무시 및 강제 오버라이드)
+
+{cond_a_block}
+
+{cond_b_block}
+➔ 판정: 🔴 대피 (시스템 장악)
+
+💡 <b>시스템 판독 및 행동 지침</b>:
+시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다. 스코어와 무관하게 즉시 모든 레버리지 및 현물을 전량 매도하고 대피하십시오."""
+
+    elif scenario_type == 'C':
+        return f"""<b>🟢 [초고속 재진입] 비트코인 숏 스퀴즈 구조대 발동</b>
+
+🚀 타겟 자산: BTC (${btc_price:,.2f})
+⏱️ 상태: 블랙스완 대피 이후 특이 현상(V자 랠리) 포착
+
+{cond_a_block}
+
+{cond_b_block}
+➔ 판정: 🟢 조건 C 충족 (강제 재진입 승인)
+
+💡 <b>시스템 판독 및 행동 지침</b>:
+세력의 유동성 사냥(Liquidity Sweep)이 종료되었습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
+    
+    return "전략 오류"
+
+def send_telegram_message(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id: return
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                      json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: pass
+
+def main():
+    print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Hybrid Ultimate Edition)...")
+    market_data = fetch_market_data()
+    btc_current_price = market_data.get('price', 0.0)
+    
+    if btc_current_price == 0.0:
+        print("API 통신 지연으로 가격을 불러오지 못했습니다. 에러 알림을 전송합니다.")
+        send_telegram_message("<b>🚨 [시스템 에러]</b> API 통신 장애 발생. 봇이 데이터를 불러오지 못했습니다. 거래소 API 상태를 확인하십시오.")
+        return
+        
+    scenario, total_score = analyze_strategy(market_data)
+    alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data)
+    send_telegram_message(alert_message)
+    print("시스템 스캔 및 프로세스 종료")
+
+if __name__ == "__main__":
+    main()
