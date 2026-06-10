@@ -3,7 +3,8 @@ import requests
 from datetime import datetime
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed 완전 독립형 엔진)
+# [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed)
+# 외부 온체인 API(크립토퀀트) 완전 제거 및 거래소 데이터 100% 자립화
 # =========================================================================
 
 def fetch_fear_and_greed_index():
@@ -24,11 +25,10 @@ def fetch_market_data():
         'vwap': 0.0,
         'is_sweep_candle': False,
         'stablecoin_peg': 1.0,
-        'rsi_4h': 50.0,
-        'price_to_ma20_ratio': 0.0,
-        'volume_exhaustion': False, 
-        'fear_greed_index': 50,
-        'mayer_multiple': 1.0
+        'rsi_1d': 50.0,             # 1D로 격상
+        'price_to_ma20_ratio': 0.0, # 1D MA20 기준
+        'mayer_multiple': 1.0,      # 자체 연산 메이어 배수 추가
+        'fear_greed_index': 50
     }
     
     headers = {
@@ -39,7 +39,7 @@ def fetch_market_data():
     try:
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
         
-        # 1. 가격 및 펀딩비 (MEXC)
+        # 1. 가격 및 펀딩비 (MEXC 실시간)
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
         if res_ticker.status_code == 200:
@@ -47,14 +47,14 @@ def fetch_market_data():
             market_data['price'] = float(ticker_data.get('lastPrice', 0))
             market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
         
-        # 2. 오더북 뎁스
+        # 2. 오더북 뎁스 (MEXC 실시간)
         depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
         depth_res = requests.get(depth_url, headers=headers, timeout=10)
         if depth_res.status_code == 200:
             bids = depth_res.json().get('data', {}).get('bids', [])
             market_data['bid_depth'] = sum([float(b[1]) * 0.0001 for b in bids if len(b) > 1])
         
-        # 3. 15분봉 미시구조
+        # 3. 15분봉 미시구조 (블랙스완 및 구조대 판독기)
         klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
         k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
         if k15_res.status_code == 200:
@@ -89,24 +89,25 @@ def fetch_market_data():
                 if lower_wick > (body * 2) and lower_wick > (market_data['price'] * 0.002): 
                     market_data['is_sweep_candle'] = True
 
-        # 4. 4시간봉 매크로 지표 (RSI & Volume)
-        klines_4h_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Hour4&limit=100"
-        k4h_res = requests.get(klines_4h_url, headers=headers, timeout=10)
-        if k4h_res.status_code == 200:
-            k4h_data = k4h_res.json().get('data', {})
-            closes_4h = [float(c) for c in k4h_data.get('close', [])]
-            vols_4h = [float(v) for v in k4h_data.get('vol', [])]
+        # 4. 일봉(1D) 매크로 지표 (Mayer Multiple, 1D RSI, 1D MA20 전면 격상)
+        klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=250"
+        k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
+        if k1d_res.status_code == 200:
+            k1d_data = k1d_res.json().get('data', {})
+            closes_1d = [float(c) for c in k1d_data.get('close', [])]
             
-            if len(closes_4h) >= 21:
-                ma20 = sum(closes_4h[-20:]) / 20
+            # 메이어 배수 연산 (현재가 / 200일 이동평균선)
+            if len(closes_1d) >= 200:
+                ma200 = sum(closes_1d[-200:]) / 200
+                market_data['mayer_multiple'] = market_data['price'] / ma200 if ma200 > 0 else 1.0
+
+            if len(closes_1d) >= 20:
+                ma20 = sum(closes_1d[-20:]) / 20
                 market_data['price_to_ma20_ratio'] = (market_data['price'] - ma20) / ma20
                 
-                vol_ma20 = sum(vols_4h[-22:-2]) / 20 if len(vols_4h) > 21 else 1
-                if vols_4h[-2] < (vol_ma20 * 0.5):
-                    market_data['volume_exhaustion'] = True
-                
-                if len(closes_4h) >= 15:
-                    diffs = [closes_4h[i] - closes_4h[i-1] for i in range(1, len(closes_4h))]
+                # 트레이딩뷰 표준 지수평활(RMA) 기반 일봉 RSI 
+                if len(closes_1d) >= 15:
+                    diffs = [closes_1d[i] - closes_1d[i-1] for i in range(1, len(closes_1d))]
                     gains = [d if d > 0 else 0 for d in diffs]
                     losses = [abs(d) if d < 0 else 0 for d in diffs]
                     
@@ -117,20 +118,10 @@ def fetch_market_data():
                         avg_gain = (avg_gain * 13 + gains[i]) / 14
                         avg_loss = (avg_loss * 13 + losses[i]) / 14
                         
-                    if avg_loss == 0: market_data['rsi_4h'] = 100.0
-                    else: market_data['rsi_4h'] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+                    if avg_loss == 0: market_data['rsi_1d'] = 100.0
+                    else: market_data['rsi_1d'] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
 
-        # 5. 일봉(1Day) 메이어 배수 연산
-        klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=200"
-        k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
-        if k1d_res.status_code == 200:
-            k1d_data = k1d_res.json().get('data', {})
-            closes_1d = [float(c) for c in k1d_data.get('close', [])]
-            if len(closes_1d) >= 200:
-                ma200 = sum(closes_1d[-200:]) / 200
-                market_data['mayer_multiple'] = market_data['price'] / ma200
-
-        # 6. 스테이블코인 페깅
+        # 5. 스테이블코인 페깅
         peg_url = "https://api.mexc.com/api/v3/ticker/price?symbol=USDCUSDT"
         peg_res = requests.get(peg_url, headers=headers, timeout=10)
         if peg_res.status_code == 200:
@@ -148,20 +139,25 @@ def fetch_market_data():
 def analyze_strategy(market):
     score = 0
     
-    if market['mayer_multiple'] >= 2.4: score += 20
-    elif market['mayer_multiple'] >= 2.0: score += 10
+    # 1. 일봉 메이어 배수 (역사적 고점 2.4, 강세장 1.5 기준)
+    if market['mayer_multiple'] >= 2.0: score += 20
+    elif market['mayer_multiple'] >= 1.5: score += 10
     
+    # 2. 공포 탐욕 지수
     if market['fear_greed_index'] >= 85: score += 20
     elif market['fear_greed_index'] >= 75: score += 10
     
+    # 3. 파생 펀딩비 과열
     if market['funding_rate_annual'] > 50.0: score += 20
     elif market['funding_rate_annual'] > 20.0: score += 10
     
-    if market['rsi_4h'] > 80.0: score += 20
-    elif market['rsi_4h'] > 70.0: score += 10
+    # 4. 일봉 매크로 RSI (1D 기준)
+    if market['rsi_1d'] > 80.0: score += 20
+    elif market['rsi_1d'] > 70.0: score += 10
     
-    if market['price_to_ma20_ratio'] > 0.10: score += 20
-    elif market['price_to_ma20_ratio'] > 0.05: score += 10
+    # 5. 일봉 이평선 이격도 (1D 밴드에 맞게 임계값 상향)
+    if market['price_to_ma20_ratio'] > 0.20: score += 20 # 20% 이상 이격
+    elif market['price_to_ma20_ratio'] > 0.10: score += 10 # 10% 이상 이격
 
     is_blackswan = False
     if market['stablecoin_peg'] < 0.985: is_blackswan = True
@@ -187,8 +183,8 @@ def analyze_strategy(market):
 def get_strategy_message(scenario_type, btc_price, score, market):
     
     mm = market['mayer_multiple']
-    if mm >= 2.4: mm_stat = f"🔴 위험 (메이어 배수 {mm:.2f} 역사적 과열)"
-    elif mm >= 2.0: mm_stat = f"🟠 경고 (메이어 배수 {mm:.2f} 강세장 과열)"
+    if mm >= 2.0: mm_stat = f"🔴 위험 (메이어 배수 {mm:.2f} 역사적 고점)"
+    elif mm >= 1.5: mm_stat = f"🟠 경고 (메이어 배수 {mm:.2f} 강세장 확장)"
     else: mm_stat = f"🟢 안전 (메이어 배수 {mm:.2f} 정상 궤도)"
     
     fgi = market['fear_greed_index']
@@ -201,14 +197,14 @@ def get_strategy_message(scenario_type, btc_price, score, market):
     elif fr > 20.0: fr_stat = f"🟠 경고 (연환산 {fr:.1f}% 누적)"
     else: fr_stat = f"🟢 안전 (정상 펀딩비)"
 
-    rsi = market['rsi_4h']
-    if rsi > 80.0: rsi_stat = f"🔴 위험 (RSI {rsi:.1f} 한계)"
-    elif rsi > 70.0: rsi_stat = f"🟠 경고 (RSI {rsi:.1f} 과매수)"
-    else: rsi_stat = f"🟢 안전 (RSI {rsi:.1f} 안정권)"
+    rsi = market['rsi_1d']
+    if rsi > 80.0: rsi_stat = f"🔴 위험 (1D RSI {rsi:.1f} 한계)"
+    elif rsi > 70.0: rsi_stat = f"🟠 경고 (1D RSI {rsi:.1f} 과매수)"
+    else: rsi_stat = f"🟢 안전 (1D RSI {rsi:.1f} 안정권)"
 
     ma_ratio = market['price_to_ma20_ratio'] * 100
-    if ma_ratio > 10.0: ma_stat = f"🔴 위험 (MA20 대비 +{ma_ratio:.1f}% 폭등)"
-    elif ma_ratio > 5.0: ma_stat = f"🟡 주의 (MA20 이격 상승)"
+    if ma_ratio > 20.0: ma_stat = f"🔴 위험 (1D MA20 대비 +{ma_ratio:.1f}% 폭등)"
+    elif ma_ratio > 10.0: ma_stat = f"🟡 주의 (1D MA20 이격 상승)"
     else: ma_stat = f"🟢 안전 (이평선 안착)"
 
     peg_stat = "🔴 위험 (디페깅)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
@@ -296,7 +292,7 @@ def send_telegram_message(text):
     except: pass
 
 def main():
-    print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Hybrid Ultimate Edition)...")
+    print(f"[{datetime.now()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Independent Macro Edition)...")
     market_data = fetch_market_data()
     btc_current_price = market_data.get('price', 0.0)
     
