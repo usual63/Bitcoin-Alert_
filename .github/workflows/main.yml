@@ -2,9 +2,9 @@ name: Bitcoin Quant Bot
 
 on:
   schedule:
-    # UTC 기준 매일 00시 05분 실행 (한국 시간 매일 오전 09시 05분)
-    - cron: '5 0 * * *'
-  workflow_dispatch: # 수동 실행 버튼 유지
+    # 글로벌 트래픽 병목을 피해 매시 7분, 37분에 몰래 구동합니다 (30분 주기)
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -29,4 +29,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CQ_API_KEY: ${{ secrets.CQ_API_KEY }}
+
+      - name: Save Bot Memory (Auto Commit)
+        run: |
+          git config --global user.name "Quant-Bot"
+          git config --global user.email "quant-bot@github.actions"
+          git add alert_state.json
+          # 메모리 파일에 변화가 있을 때만 깃허브에 저장하여 다음 구동 시 기억을 유지합니다
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update bot memory state" && git push)
