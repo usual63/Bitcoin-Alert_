@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # ★ 필수 추가: 깃허브 액션 봇이 alert_state.json 파일을 리포지토리에 쓸 수 있는 권한 부여
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout repository
