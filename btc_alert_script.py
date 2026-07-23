@@ -18,7 +18,7 @@ def load_state():
         "last_daily_date": None, 
         "last_score": None, 
         "last_scenario": None, 
-        "last_dca_stage": None,  # DCA 매매 구간 변동 추적용 추가
+        "last_dca_stage": None,
         "last_error_date": None
     }
 
@@ -30,7 +30,7 @@ def save_state(state):
         print(f"상태 저장 실패: {e}")
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (기존 + DCA 심층 지표 추가)
+# [1] 실시간 API 데이터 수집 모듈 (DCA 퍼센트 기반 지표 추가)
 # =========================================================================
 
 def fetch_mvrv_ratio():
@@ -62,8 +62,8 @@ def fetch_market_data():
         'atr_15m_avg': 0.0, 'max_tr_15m': 0.0, 'vwap': 0.0,
         'is_sweep_candle': False, 'stablecoin_peg': 1.0, 'rsi_1d': 50.0,
         'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50,
-        # DCA 전용 S급 지표 변수 추가
-        'cb_premium': 0.0, 'cvd_status': 0, 'oi_trend': 0.0, 'vol_ratio': 1.0
+        # 'cb_premium' 대신 퍼센트 기반 'cb_premium_pct'로 변수명 변경
+        'cb_premium_pct': 0.0, 'cvd_status': 0, 'oi_trend': 0.0, 'vol_ratio': 1.0
     }
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json'}
     
@@ -79,15 +79,20 @@ def fetch_market_data():
             market_data['price'] = float(ticker_data.get('lastPrice', 0))
             market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
         
-        # 2. 코인베이스 현물 가격 가져오기 (프리미엄 계산용 추가)
+        # 2. 코인베이스 현물 가격 가져오기 및 '비율(%)' 기반 프리미엄 계산
         try:
             cb_res = requests.get('https://api.coinbase.com/v2/prices/BTC-USD/spot', timeout=5)
             cb_price = float(cb_res.json()['data']['amount'])
-            market_data['cb_premium'] = cb_price - market_data['price']
+            
+            # API 통신 에러로 price가 0일 때 발생하는 치명적 크래시(0 나누기) 완벽 방어
+            if market_data['price'] > 0:
+                market_data['cb_premium_pct'] = ((cb_price - market_data['price']) / market_data['price']) * 100
+            else:
+                market_data['cb_premium_pct'] = 0.0
         except:
-            market_data['cb_premium'] = 0.0
+            market_data['cb_premium_pct'] = 0.0
 
-        # 기존 뎁스 및 K-Line 연산 로직 (그대로 유지)
+        # 기존 뎁스 및 K-Line 연산 로직
         depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
         depth_res = requests.get(depth_url, headers=headers, timeout=10)
         if depth_res.status_code == 200:
@@ -162,11 +167,10 @@ def fetch_market_data():
     return market_data
 
 # =========================================================================
-# [2] 하이브리드 전략 및 DCA 스코어 엔진
+# [2] 하이브리드 전략 및 퍼센트 기반 DCA 스코어 엔진
 # =========================================================================
 
 def analyze_strategy(market):
-    # 기존 로직 (건드리지 않음)
     score = 0
     if market['mvrv_ratio'] >= 3.0: score += 20
     elif market['mvrv_ratio'] >= 2.4: score += 10
@@ -202,35 +206,38 @@ def analyze_strategy(market):
     return scenario, score
 
 def analyze_dca_score(market):
-    """
-    S급 5가지 지표를 활용한 -100점 ~ +100점 기반 통합 마켓 스코어 산출
-    (온체인 데이터가 없는 부분은 0점 중립 처리 또는 연동 가능하게 구조화)
-    """
     dca_score = 0
     details = {}
     
-    # 1. 코인베이스 프리미엄 (30점 만점)
-    cb_val = market['cb_premium']
-    if cb_val >= 30: s_cb = 30; msg_cb = "+$30 이상 (기관 공격적 매수)"
-    elif cb_val >= 10: s_cb = 15; msg_cb = "+$10~$29 (기관 매수 우위)"
-    elif cb_val <= -30: s_cb = -30; msg_cb = "-$30 이하 (기관 공격적 매도)"
-    elif cb_val <= -10: s_cb = -15; msg_cb = "-$10~-$29 (기관 매도 우위)"
-    else: s_cb = 0; msg_cb = "중립 횡보"
+    # 1. 코인베이스 프리미엄 (30점 만점) - 퍼센트(%) 기반으로 어떤 가격대든 영구적 대응 완료
+    cb_val = market.get('cb_premium_pct', 0.0)
+    
+    if cb_val >= 0.10: 
+        s_cb = 30; msg_cb = f"+{cb_val:.3f}% (기관 공격적 매수)"
+    elif cb_val >= 0.05: 
+        s_cb = 15; msg_cb = f"+{cb_val:.3f}% (기관 매수 우위)"
+    elif cb_val <= -0.10: 
+        s_cb = -30; msg_cb = f"{cb_val:.3f}% (기관 공격적 매도)"
+    elif cb_val <= -0.05: 
+        s_cb = -15; msg_cb = f"{cb_val:.3f}% (기관 매도 우위)"
+    else: 
+        s_cb = 0; msg_cb = f"{cb_val:.3f}% (중립 횡보)"
+        
     dca_score += s_cb
     details['cb'] = {'score': s_cb, 'msg': msg_cb, 'val': cb_val}
     
-    # 2. 펀딩비 (20점 만점) - 기존 연환산 펀딩비 데이터 역이용
-    fr_val = market['funding_rate_annual'] / (3 * 365 * 100) # 연환산을 다시 % 단위로 원복
+    # 2. 펀딩비 (20점 만점) - 퍼센트 단위 원복
+    fr_val = market['funding_rate_annual'] / (3 * 365 * 100) 
     if fr_val <= -0.01: s_fr = 20; msg_fr = "극단적 공포 숏"
     elif fr_val <= 0.0: s_fr = 10; msg_fr = "음수(마이너스) 유지"
     elif fr_val >= 0.04: s_fr = -20; msg_fr = "극단적 롱 과열 (청산 임박)"
     elif fr_val >= 0.02: s_fr = -10; msg_fr = "롱 과열 심화"
     else: s_fr = 0; msg_fr = "베이스라인 정상"
+    
     dca_score += s_fr
     details['fr'] = {'score': s_fr, 'msg': msg_fr, 'val': market['funding_rate_annual']}
     
-    # 3, 4, 5. CVD, OI, 거래량 비율은 DB 연결이 필요하므로 현재 중립(0점)으로 구조만 확립 
-    # (향후 데이터 연동 시 s_cvd, s_oi, s_vol 값만 분기해주면 자동 연산됨)
+    # 3, 4, 5. 미연동 지표 중립 처리
     s_cvd, s_oi, s_vol = 0, 0, 0
     details['cvd'] = {'score': s_cvd, 'msg': "데이터 대기중 (중립)"}
     details['oi'] = {'score': s_oi, 'msg': "데이터 대기중 (중립)"}
@@ -249,12 +256,11 @@ def analyze_dca_score(market):
     return dca_score, stage, stage_ko, details
 
 # =========================================================================
-# [3] 동적 텔레그램 메시지 발송
+# [3] 동적 텔레그램 메시지 발송 모듈
 # =========================================================================
 
 def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DAILY"):
     
-    # --- 기존 메시지 블록 포매팅 ---
     mvrv = market['mvrv_ratio']
     if mvrv >= 3.0: mvrv_stat = f"🔴 위험 (MVRV 비율 {mvrv:.2f} 역사적 고평가)"
     elif mvrv >= 2.4: mvrv_stat = f"🟠 경고 (MVRV 비율 {mvrv:.2f} 강세장 후반)"
@@ -298,7 +304,6 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 • 오더북 뎁스 붕괴: {depth_stat}
 • 청산맵/ATR 폭발: {atr_stat}"""
 
-    # --- 신규 DCA 블록 포매팅 ---
     dca_score, stage, stage_ko, dca_dtls = analyze_dca_score(market)
     
     if stage == "Extreme Buy": action_dca = "기관 매집 및 숏 스퀴즈 구간입니다. 시드의 40~50%를 공격적으로 매수하십시오."
@@ -323,13 +328,11 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 => 🤖 DCA 액션 가이드: 
 {action_dca}"""
 
-    # 기존 조건 A/B 기반의 행동 지침
     if score >= 80: action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
     elif score >= 50: action_advice = "시장의 쏠림과 구조적 과열이 강합니다. 알트코인 전량 매도 및 비트코인 50% 분할 익절을 권장합니다."
     elif score >= 30: action_advice = "과열 징후가 포착되었습니다. 신규 진입을 중단하고 레버리지를 축소하십시오."
     else: action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
 
-    # 알림 모드에 따른 헤더 분기
     if alert_mode == "DAILY":
         prefix = "🌅 <b>[오전 07:30 정규 브리핑]</b>\n"
     elif alert_mode == "DCA_CHANGE":
@@ -337,7 +340,6 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
     else:
         prefix = "⚡ <b>[위험도 지표 변동 긴급 알림]</b>\n"
 
-    # 시나리오에 따른 메시지 조립
     if scenario_type == 'A':
         if score >= 80: header_title = prefix + "🚨 [전량 매도] 비트코인 하이브리드 위험도 분석"
         elif score >= 50: header_title = prefix + "🔴 [강력 경고] 비트코인 하이브리드 위험도 분석"
@@ -423,21 +425,15 @@ def main():
     scenario, total_score = analyze_strategy(market_data)
     dca_score, dca_stage, _, _ = analyze_dca_score(market_data)
     
-    # 정규 브리핑 시간 조건
     current_minutes = current_kst.hour * 60 + current_kst.minute
     target_minutes = 7 * 60 + 30
     
     is_daily_needed = (current_minutes >= target_minutes) and (state.get("last_daily_date") != kst_date_str)
-    
-    # 2가지 종류의 상태 변동 감지 (기존 A조건 변동 vs 신규 C조건 변동)
     is_state_changed = (state.get("last_score") != total_score) or (state.get("last_scenario") != scenario)
     is_dca_changed = (state.get("last_dca_stage") != dca_stage)
-    
-    # 최초 실행(기억 없음)인지 여부 확인
     is_first_run = (state.get("last_score") is None or state.get("last_dca_stage") is None)
 
     if is_daily_needed:
-        # [정규 브리핑] 발송
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DAILY")
         send_telegram_message(alert_message)
         
@@ -449,7 +445,6 @@ def main():
         print("정규 브리핑 발송 완료")
         
     elif not is_first_run and is_dca_changed:
-        # [DCA 매매 구간 변동 알림] 발송 (최우선 긴급도)
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DCA_CHANGE")
         send_telegram_message(alert_message)
         
@@ -460,7 +455,6 @@ def main():
         print("DCA 매매 구간 변동 긴급 알림 발송 완료")
         
     elif not is_first_run and is_state_changed:
-        # [기존 지표 변동 알림] 발송
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="CHANGE")
         send_telegram_message(alert_message)
         
@@ -470,7 +464,6 @@ def main():
         print("위험도 지표 변동 긴급 알림 발송 완료")
         
     elif is_first_run:
-        # 시스템 최초 실행 시 데이터만 저장하고 침묵
         state["last_score"] = total_score
         state["last_scenario"] = scenario
         state["last_dca_stage"] = dca_stage
