@@ -62,7 +62,6 @@ def fetch_market_data():
         'atr_15m_avg': 0.0, 'max_tr_15m': 0.0, 'vwap': 0.0,
         'is_sweep_candle': False, 'stablecoin_peg': 1.0, 'rsi_1d': 50.0,
         'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50,
-        # 'cb_premium' 대신 퍼센트 기반 'cb_premium_pct'로 변수명 변경
         'cb_premium_pct': 0.0, 'cvd_status': 0, 'oi_trend': 0.0, 'vol_ratio': 1.0
     }
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json'}
@@ -71,7 +70,6 @@ def fetch_market_data():
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
         market_data['mvrv_ratio'] = fetch_mvrv_ratio()
         
-        # 1. MEXC 비트코인 선물 현재가 및 펀딩비
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
         if res_ticker.status_code == 200:
@@ -79,12 +77,10 @@ def fetch_market_data():
             market_data['price'] = float(ticker_data.get('lastPrice', 0))
             market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
         
-        # 2. 코인베이스 현물 가격 가져오기 및 '비율(%)' 기반 프리미엄 계산
         try:
             cb_res = requests.get('https://api.coinbase.com/v2/prices/BTC-USD/spot', timeout=5)
             cb_price = float(cb_res.json()['data']['amount'])
             
-            # API 통신 에러로 price가 0일 때 발생하는 치명적 크래시(0 나누기) 완벽 방어
             if market_data['price'] > 0:
                 market_data['cb_premium_pct'] = ((cb_price - market_data['price']) / market_data['price']) * 100
             else:
@@ -92,7 +88,6 @@ def fetch_market_data():
         except:
             market_data['cb_premium_pct'] = 0.0
 
-        # 기존 뎁스 및 K-Line 연산 로직
         depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
         depth_res = requests.get(depth_url, headers=headers, timeout=10)
         if depth_res.status_code == 200:
@@ -167,7 +162,7 @@ def fetch_market_data():
     return market_data
 
 # =========================================================================
-# [2] 하이브리드 전략 및 퍼센트 기반 DCA 스코어 엔진
+# [2] 하이브리드 전략 및 노이즈 방지용 넓은 범위의 DCA 스코어 엔진
 # =========================================================================
 
 def analyze_strategy(market):
@@ -209,9 +204,8 @@ def analyze_dca_score(market):
     dca_score = 0
     details = {}
     
-    # 1. 코인베이스 프리미엄 (30점 만점) - 퍼센트(%) 기반으로 어떤 가격대든 영구적 대응 완료
+    # 1. 코인베이스 프리미엄
     cb_val = market.get('cb_premium_pct', 0.0)
-    
     if cb_val >= 0.10: 
         s_cb = 30; msg_cb = f"+{cb_val:.3f}% (기관 공격적 매수)"
     elif cb_val >= 0.05: 
@@ -226,7 +220,7 @@ def analyze_dca_score(market):
     dca_score += s_cb
     details['cb'] = {'score': s_cb, 'msg': msg_cb, 'val': cb_val}
     
-    # 2. 펀딩비 (20점 만점) - 퍼센트 단위 원복
+    # 2. 펀딩비
     fr_val = market['funding_rate_annual'] / (3 * 365 * 100) 
     if fr_val <= -0.01: s_fr = 20; msg_fr = "극단적 공포 숏"
     elif fr_val <= 0.0: s_fr = 10; msg_fr = "음수(마이너스) 유지"
@@ -244,14 +238,12 @@ def analyze_dca_score(market):
     details['vol'] = {'score': s_vol, 'msg': "데이터 대기중 (중립)"}
     dca_score += (s_cvd + s_oi + s_vol)
     
-    # 구간 판별 로직
+    # [수정됨] 잦은 알림 방지를 위해 관망/유지 구간을 ±29점까지 대폭 확대하여 6개 핵심 액션으로 압축
     if dca_score >= 70: stage = "Extreme Buy"; stage_ko = "🟢 강력 매수 (Extreme Buy)"
     elif dca_score >= 30: stage = "Gradual Buy"; stage_ko = "🟢 점진 매수 (Gradual Buy)"
-    elif dca_score >= 10: stage = "Hold & Wait"; stage_ko = "🟡 관망/유지 (Hold & Wait)"
-    elif dca_score > -10: stage = "Neutral"; stage_ko = "⚪ 중립 구간 (Neutral)"
-    elif dca_score > -30: stage = "Caution"; stage_ko = "🟠 위험 경고 (Caution)"
-    elif dca_score > -70: stage = "Gradual Sell"; stage_ko = "🔴 점진 매도 (Gradual Sell)"
-    else: stage = "Extreme Sell"; stage_ko = "🚨 강력 매도 (Extreme Sell)"
+    elif dca_score <= -70: stage = "Extreme Sell"; stage_ko = "🚨 강력 매도 (Extreme Sell)"
+    elif dca_score <= -30: stage = "Gradual Sell"; stage_ko = "🔴 점진 매도 (Gradual Sell)"
+    else: stage = "Hold & Wait"; stage_ko = "🟡 관망 및 유지 (Hold & Wait)"
     
     return dca_score, stage, stage_ko, details
 
@@ -308,11 +300,9 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
     
     if stage == "Extreme Buy": action_dca = "기관 매집 및 숏 스퀴즈 구간입니다. 시드의 40~50%를 공격적으로 매수하십시오."
     elif stage == "Gradual Buy": action_dca = "건강한 상승 초입입니다. 보유 시드의 10~20%씩 점진적 분할 매수를 진행하십시오."
-    elif stage == "Hold & Wait": action_dca = "추세 전환 모색 구간입니다. 신규 진입을 보류하고 관망하십시오."
-    elif stage == "Neutral": action_dca = "명확한 주도세가 없는 중립 횡보 구간입니다."
-    elif stage == "Caution": action_dca = "추세가 꺾이기 시작했습니다. 신규 매수를 중지하고 리스크를 관리하십시오."
+    elif stage == "Extreme Sell": action_dca = "레버리지 거품 붕괴 직전입니다. 즉시 물량의 70~100%를 시장가 매도하여 현금화하십시오."
     elif stage == "Gradual Sell": action_dca = "상승이 한계에 달했습니다. 알림 시마다 보유 물량의 10~20%씩 분할 매도하십시오."
-    else: action_dca = "레버리지 거품 붕괴 직전입니다. 즉시 물량의 70~100%를 시장가 매도하여 현금화하십시오."
+    else: action_dca = "추세 전환을 모색하거나 명확한 주도세가 없는 구간입니다. 관망 및 기존 포지션을 유지하십시오."
 
     cond_c_block = f"""══════════════════════
 <b>[조건 C: 퀀트 스코어 기반 DCA 매매 가이드]</b>
