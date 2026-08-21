@@ -51,7 +51,6 @@ def fetch_fear_and_greed_index():
     return 50
 
 def fetch_open_interest():
-    # 글로벌 표준 유동성인 바이낸스 선물의 미결제약정(BTC 갯수) 활용
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=5)
         if res.status_code == 200: return float(res.json().get('openInterest', 0.0))
@@ -154,7 +153,7 @@ def fetch_market_data():
     return market_data
 
 # =========================================================================
-# [2] 하이브리드 전략 엔진 (Order-Flow Matrix 적용)
+# [2] 하이브리드 전략 엔진
 # =========================================================================
 
 def analyze_strategy(market):
@@ -165,16 +164,15 @@ def analyze_strategy(market):
     if market['fear_greed_index'] >= 85: score += 20
     elif market['fear_greed_index'] >= 75: score += 10
     
-    # [오더플로우 3D 매트릭스 채점] 단일 펀딩비 평가 탈피
+    # [조건 A 변경점] 오더플로우 3D 매트릭스 채점
     price_delta = market.get('price_change_pct', 0.0)
     oi_delta = market.get('oi_change_pct', 0.0)
     fr = market['funding_rate_annual']
     
     if price_delta > 0.0 and oi_delta > 2.0 and fr > 30.0:
-        score += 20 # 명백한 롱 투기 과열 (모래성 상승)
+        score += 20 
     elif price_delta > 0.0 and oi_delta > 1.0 and fr > 20.0:
-        score += 10 # 롱 투기 진입 경고
-    # 현물이 주도(OI 정체/감소)하는 튼튼한 상승일 경우 과열 점수(0점) 부여 안 함
+        score += 10 
     
     if market['rsi_1d'] > 80.0: score += 20
     elif market['rsi_1d'] > 70.0: score += 10
@@ -188,8 +186,8 @@ def analyze_strategy(market):
     if market['max_tr_15m'] > (market['price'] * 0.05): is_blackswan = True
 
     rescue_triggers = 0
-    # 숏 스퀴즈 역시 극음수 펀딩비 + OI 급등(숏 집중) 상태를 교차 검증
-    if price_delta < 0.0 and oi_delta > 1.0 and fr < -20.0: rescue_triggers += 1 
+    # [조건 C 원상복구] 사용자 락온 기준인 펀딩비 극음수(-50.0) 트리거 유지
+    if market['funding_rate_annual'] < -50.0: rescue_triggers += 1
     if market['is_sweep_candle']: rescue_triggers += 1
     if market['price'] > market['vwap']: rescue_triggers += 1
     
@@ -352,12 +350,10 @@ def main():
             save_state(state)
         return
 
-    # [핵심] 당일 시가(07:30) 기준 가격 및 미결제약정(OI) 변화율 계산
     daily_open_price = state.get("daily_open_price", 0.0)
     daily_open_oi = state.get("daily_open_oi", 0.0)
     
     if daily_open_price == 0.0 or daily_open_oi == 0.0:
-        # 최초 실행 시 현재값을 기준점으로 설정
         daily_open_price = btc_current_price
         daily_open_oi = market_data['open_interest']
         
@@ -373,7 +369,6 @@ def main():
     is_state_changed = (state.get("last_score") != total_score) or (state.get("last_scenario") != scenario)
     
     if is_daily_needed:
-        # 매일 아침 정규 브리핑을 쏠 때, 변화율 계산을 위한 '시가'와 '오픈 OI' 리셋
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DAILY")
         send_telegram_message(alert_message)
         
@@ -383,7 +378,7 @@ def main():
         state["daily_open_price"] = btc_current_price
         state["daily_open_oi"] = market_data['open_interest']
         save_state(state)
-        print("정규 브리핑 발송 및 일간 기준점(Price/OI) 리셋 완료")
+        print("정규 브리핑 발송 및 일간 기준점 리셋 완료")
         
     elif is_state_changed and state.get("last_score") is not None:
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="CHANGE")
@@ -400,9 +395,9 @@ def main():
         state["daily_open_price"] = btc_current_price
         state["daily_open_oi"] = market_data['open_interest']
         save_state(state)
-        print("시스템 최초 실행: 상태 및 시가 기준점 저장 완료")
+        print("시스템 최초 실행 상태 저장 완료")
     else:
-        print("지표 변동 없음. 침묵을 유지합니다.")
+        print("지표 변동 없음 침묵을 유지합니다")
 
 if __name__ == "__main__":
     main()
