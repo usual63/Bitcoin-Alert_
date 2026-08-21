@@ -14,10 +14,7 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except: pass
-    return {
-        "last_daily_date": None, "last_score": None, "last_scenario": None, 
-        "last_error_date": None, "daily_open_price": 0.0, "daily_open_oi": 0.0
-    }
+    return {"last_daily_date": None, "last_score": None, "last_scenario": None, "last_error_date": None}
 
 def save_state(state):
     try:
@@ -27,7 +24,7 @@ def save_state(state):
         print(f"상태 저장 실패: {e}")
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (MEXC + Binance OI + CoinMetrics)
+# [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed + CoinMetrics Free API)
 # =========================================================================
 
 def fetch_mvrv_ratio():
@@ -36,41 +33,35 @@ def fetch_mvrv_ratio():
         start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
         url = f"https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=CapMVRVCur&start_time={start_str}&frequency=1d"
         res = requests.get(url, timeout=10)
+        
         if res.status_code == 200:
             data = res.json().get('data', [])
             if data:
                 return float(data[-1].get('CapMVRVCur', 1.0))
-    except: pass
+    except Exception as e:
+        print(f"MVRV Ratio 통신 에러: {e}")
     return 1.0 
 
 def fetch_fear_and_greed_index():
     try:
         res = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-        if res.status_code == 200: return int(res.json()['data'][0]['value'])
+        if res.status_code == 200:
+            return int(res.json()['data'][0]['value'])
     except: pass
     return 50
-
-def fetch_open_interest():
-    try:
-        res = requests.get("https://fapi.binance.com/fapi/v1/openInterest?symbol=BTCUSDT", timeout=5)
-        if res.status_code == 200: return float(res.json().get('openInterest', 0.0))
-    except: pass
-    return 0.0
 
 def fetch_market_data():
     market_data = {
         'price': 0.0, 'funding_rate_annual': 0.0, 'bid_depth': 0.0,
         'atr_15m_avg': 0.0, 'max_tr_15m': 0.0, 'vwap': 0.0,
         'is_sweep_candle': False, 'stablecoin_peg': 1.0, 'rsi_1d': 50.0,
-        'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50,
-        'open_interest': 0.0
+        'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50
     }
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json'}
     
     try:
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
         market_data['mvrv_ratio'] = fetch_mvrv_ratio()
-        market_data['open_interest'] = fetch_open_interest()
         
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
@@ -164,15 +155,8 @@ def analyze_strategy(market):
     if market['fear_greed_index'] >= 85: score += 20
     elif market['fear_greed_index'] >= 75: score += 10
     
-    # [조건 A 변경점] 오더플로우 3D 매트릭스 채점
-    price_delta = market.get('price_change_pct', 0.0)
-    oi_delta = market.get('oi_change_pct', 0.0)
-    fr = market['funding_rate_annual']
-    
-    if price_delta > 0.0 and oi_delta > 2.0 and fr > 30.0:
-        score += 20 
-    elif price_delta > 0.0 and oi_delta > 1.0 and fr > 20.0:
-        score += 10 
+    if market['funding_rate_annual'] > 50.0: score += 20
+    elif market['funding_rate_annual'] > 20.0: score += 10
     
     if market['rsi_1d'] > 80.0: score += 20
     elif market['rsi_1d'] > 70.0: score += 10
@@ -186,7 +170,6 @@ def analyze_strategy(market):
     if market['max_tr_15m'] > (market['price'] * 0.05): is_blackswan = True
 
     rescue_triggers = 0
-    # [조건 C 원상복구] 사용자 락온 기준인 펀딩비 극음수(-50.0) 트리거 유지
     if market['funding_rate_annual'] < -50.0: rescue_triggers += 1
     if market['is_sweep_candle']: rescue_triggers += 1
     if market['price'] > market['vwap']: rescue_triggers += 1
@@ -214,27 +197,10 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
     elif fgi >= 75: fgi_stat = f"🟠 경고 (탐욕 진입 {fgi})"
     else: fgi_stat = f"🟢 안전 (중립 또는 공포 {fgi})"
 
-    # 주체 판독 텍스트 엔진
-    price_delta = market.get('price_change_pct', 0.0)
-    oi_delta = market.get('oi_change_pct', 0.0)
     fr = market['funding_rate_annual']
-    
-    if price_delta > 0:
-        if oi_delta > 1.0 and fr > 20.0:
-            order_flow_stat = f"🔴 모래성 상승 (파생 롱 투기 주도 / OI {oi_delta:+.1f}%)"
-        elif oi_delta < -1.0:
-            order_flow_stat = f"🟢 콘크리트 상승 (현물 주도 / OI {oi_delta:+.1f}%)"
-        else:
-            order_flow_stat = f"🟡 중립적 상승 (OI {oi_delta:+.1f}%)"
-    elif price_delta < 0:
-        if oi_delta > 1.0 and fr < 0.0:
-            order_flow_stat = f"🔴 인위적 하락 (파생 숏 투기 주도 / OI {oi_delta:+.1f}%)"
-        elif oi_delta < -1.0:
-            order_flow_stat = f"🟡 진짜 하락 (현물 투매 동반 / OI {oi_delta:+.1f}%)"
-        else:
-            order_flow_stat = f"🟡 중립적 하락 (OI {oi_delta:+.1f}%)"
-    else:
-        order_flow_stat = "🟢 보합세 (방향성 부재)"
+    if fr > 50.0: fr_stat = f"🔴 위험 (연환산 {fr:.1f}% 과열)"
+    elif fr > 20.0: fr_stat = f"🟠 경고 (연환산 {fr:.1f}% 누적)"
+    else: fr_stat = f"🟢 안전 (정상 펀딩비)"
 
     rsi = market['rsi_1d']
     if rsi > 80.0: rsi_stat = f"🔴 위험 (1D RSI {rsi:.1f} 한계)"
@@ -251,21 +217,21 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
     atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
 
     cond_a_block = f"""══════════════════════
-<b>[조건 A: 온체인/오더플로우 복합 과열 현황]</b>
+<b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
 • 온체인 MVRV(20): {mvrv_stat}
 • 공포 탐욕(20): {fgi_stat}
-• 세력 판독기(20): {order_flow_stat}
+• 파생 과열(20): {fr_stat}
 • 매크로 RSI(20): {rsi_stat}
 • 이평선 이격(20): {ma_stat}"""
 
     cond_b_block = f"""══════════════════════
-<b>[조건 B: 블랙스완 킬 스위치 현황]</b>
+<b>[조건 B: 블랙스완 킬 스위 현황]</b>
 • 스테이블 뱅크런: {peg_stat}
 • 오더북 뎁스 붕괴: {depth_stat}
 • 청산맵/ATR 폭발: {atr_stat}"""
 
     if score >= 80:
-        action_advice = "대중의 탐욕과 파생 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
+        action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
         header_title = "🚨 [전량 매도] 비트코인 하이브리드 위험도 분석"
     elif score >= 50:
         action_advice = "시장의 쏠림과 구조적 과열이 강합니다. 알트코인 전량 매도 및 비트코인 50% 분할 익절을 권장합니다."
@@ -274,9 +240,10 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
         action_advice = "과열 징후가 포착되었습니다. 신규 진입을 중단하고 레버리지를 축소하십시오."
         header_title = "🟠 [비중 축소] 비트코인 하이브리드 위험도 분석"
     else:
-        action_advice = "온체인 및 파생 투기 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
+        action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
         header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
 
+    # 알림 모드에 따른 헤더 접두사 동적 추가
     prefix = "🌅 <b>[오전 07:30 정규 브리핑]</b>\n" if alert_mode == "DAILY" else "⚡ <b>[지표 변동 긴급 알림]</b>\n"
     header_title = prefix + header_title
 
@@ -334,14 +301,15 @@ def send_telegram_message(text):
     except: pass
 
 def main():
-    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Order-Flow Matrix Edition)...")
+    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Event-Driven Edition)...")
     
     current_kst = datetime.utcnow() + timedelta(hours=9)
     kst_date_str = current_kst.strftime('%Y-%m-%d')
     
-    state = load_state()
     market_data = fetch_market_data()
     btc_current_price = market_data.get('price', 0.0)
+    
+    state = load_state()
     
     if btc_current_price == 0.0:
         if state.get("last_error_date") != kst_date_str:
@@ -349,19 +317,10 @@ def main():
             state["last_error_date"] = kst_date_str
             save_state(state)
         return
-
-    daily_open_price = state.get("daily_open_price", 0.0)
-    daily_open_oi = state.get("daily_open_oi", 0.0)
-    
-    if daily_open_price == 0.0 or daily_open_oi == 0.0:
-        daily_open_price = btc_current_price
-        daily_open_oi = market_data['open_interest']
-        
-    market_data['price_change_pct'] = ((btc_current_price - daily_open_price) / daily_open_price * 100) if daily_open_price > 0 else 0.0
-    market_data['oi_change_pct'] = ((market_data['open_interest'] - daily_open_oi) / daily_open_oi * 100) if daily_open_oi > 0 else 0.0
         
     scenario, total_score = analyze_strategy(market_data)
     
+    # 오전 7시 30분 이후이고, 오늘 정규 브리핑을 아직 안 보냈다면 전송 (데일리 조건)
     current_minutes = current_kst.hour * 60 + current_kst.minute
     target_minutes = 7 * 60 + 30
     
@@ -369,18 +328,18 @@ def main():
     is_state_changed = (state.get("last_score") != total_score) or (state.get("last_scenario") != scenario)
     
     if is_daily_needed:
+        # [정규 브리핑] 발송
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DAILY")
         send_telegram_message(alert_message)
         
         state["last_daily_date"] = kst_date_str
         state["last_score"] = total_score
         state["last_scenario"] = scenario
-        state["daily_open_price"] = btc_current_price
-        state["daily_open_oi"] = market_data['open_interest']
         save_state(state)
-        print("정규 브리핑 발송 및 일간 기준점 리셋 완료")
+        print("정규 브리핑 발송 완료")
         
     elif is_state_changed and state.get("last_score") is not None:
+        # [지표 변동 알림] 발송 (최초 실행 시에는 변동 알림을 생략하기 위해 None 체크)
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="CHANGE")
         send_telegram_message(alert_message)
         
@@ -390,14 +349,13 @@ def main():
         print("지표 변동 긴급 알림 발송 완료")
         
     elif state.get("last_score") is None:
+        # 시스템 최초 실행 시 데이터만 저장하고 침묵
         state["last_score"] = total_score
         state["last_scenario"] = scenario
-        state["daily_open_price"] = btc_current_price
-        state["daily_open_oi"] = market_data['open_interest']
         save_state(state)
-        print("시스템 최초 실행 상태 저장 완료")
+        print("시스템 최초 실행: 상태 저장 완료")
     else:
-        print("지표 변동 없음 침묵을 유지합니다")
+        print("지표 변동 없음. 침묵을 유지합니다.")
 
 if __name__ == "__main__":
     main()
