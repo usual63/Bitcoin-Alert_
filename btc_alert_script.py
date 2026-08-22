@@ -14,7 +14,13 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 return json.load(f)
         except: pass
-    return {"last_daily_date": None, "last_score": None, "last_scenario": None, "last_error_date": None}
+    return {
+        "last_daily_date": None, 
+        "last_score": None, 
+        "last_scenario": None, 
+        "last_c_state": None, # [신규] 조건 C의 상태를 통째로 굽는 센서
+        "last_error_date": None
+    }
 
 def save_state(state):
     try:
@@ -57,7 +63,7 @@ def fetch_market_data():
         'is_sweep_candle': False, 'stablecoin_peg': 1.0, 'rsi_1d': 50.0,
         'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50
     }
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36', 'Accept': 'application/json'}
+    headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
     
     try:
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
@@ -216,6 +222,14 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
     depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 20 else "🟢 안전"
     atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
 
+    # [수정] 조건 C (현물 구조대) 상태 텍스트
+    is_sweep = market['is_sweep_candle']
+    is_vwap_above = market['price'] > market['vwap']
+    
+    fr_c_stat = f"🔴 숏 과열 (연환산 {fr:.1f}%)" if fr < -50.0 else f"⚪ 대기 (연환산 {fr:.1f}%)"
+    sweep_stat = "🟢 포착됨 (현물 방어)" if is_sweep else "⚪ 대기"
+    vwap_stat = "🟢 상향 돌파 (현물 매수 우위)" if is_vwap_above else "⚪ 하회"
+
     cond_a_block = f"""══════════════════════
 <b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
 • 온체인 MVRV(20): {mvrv_stat}
@@ -230,6 +244,12 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 • 오더북 뎁스 붕괴: {depth_stat}
 • 청산맵/ATR 폭발: {atr_stat}"""
 
+    cond_c_block = f"""══════════════════════
+<b>[조건 C: 숏 스퀴즈 현물 구조대 현황]</b>
+• 펀딩비 극음수: {fr_c_stat}
+• 스윕 캔들 출현: {sweep_stat}
+• VWAP 상향 돌파: {vwap_stat}"""
+
     if score >= 80:
         action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
         header_title = "🚨 [전량 매도] 비트코인 하이브리드 위험도 분석"
@@ -243,7 +263,6 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
         action_advice = "온체인 및 기술적 지표 모두 과열되지 않은 안전 구간입니다. 기존 포지션을 유지하십시오."
         header_title = "🟢 [안전 유지] 비트코인 하이브리드 위험도 분석"
 
-    # 알림 모드에 따른 헤더 접두사 동적 추가
     prefix = "🌅 <b>[오전 07:30 정규 브리핑]</b>\n" if alert_mode == "DAILY" else "⚡ <b>[지표 변동 긴급 알림]</b>\n"
     header_title = prefix + header_title
 
@@ -257,6 +276,9 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 
 {cond_b_block}
 ➔ 판정: 🟢 안전 (조건 미달)
+
+{cond_c_block}
+➔ 판정: ⚪ 대기 (조건 미달)
 
 💡 <b>시스템 판독 및 행동 지침</b>: 
 {action_advice}"""
@@ -272,6 +294,9 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 {cond_b_block}
 ➔ 판정: 🔴 대피 (시스템 장악)
 
+{cond_c_block}
+➔ 판정: ⚪ 대기 (구조대 미도착)
+
 💡 <b>시스템 판독 및 행동 지침</b>:
 시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다. 스코어와 무관하게 즉시 모든 레버리지 및 현물을 전량 매도하고 대피하십시오."""
 
@@ -279,12 +304,14 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
         return f"""{prefix}<b>🟢 [초고속 재진입] 비트코인 숏 스퀴즈 구조대 발동</b>
 
 🚀 타겟 자산: BTC (${btc_price:,.2f})
-⏱️ 상태: 블랙스완 대피 이후 특이 현상(V자 랠리) 포착
+⏱️ 상태: 블랙스완 대피 이후 현물 세력 개입(V자 랠리) 포착
 
 {cond_a_block}
 
 {cond_b_block}
-➔ 판정: 🟢 조건 C 충족 (강제 재진입 승인)
+
+{cond_c_block}
+➔ 판정: 🟢 출동 (강제 재진입 승인)
 
 💡 <b>시스템 판독 및 행동 지침</b>:
 세력의 유동성 사냥(Liquidity Sweep)이 종료되었습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
@@ -301,7 +328,7 @@ def send_telegram_message(text):
     except: pass
 
 def main():
-    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Event-Driven Edition)...")
+    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Hybrid Event-Driven Edition)...")
     
     current_kst = datetime.utcnow() + timedelta(hours=9)
     kst_date_str = current_kst.strftime('%Y-%m-%d')
@@ -320,42 +347,48 @@ def main():
         
     scenario, total_score = analyze_strategy(market_data)
     
-    # 오전 7시 30분 이후이고, 오늘 정규 브리핑을 아직 안 보냈다면 전송 (데일리 조건)
+    # [핵심] 조건 C의 현재 상태를 통째로 굽는 센서 (Boolean 조합)
+    current_c_state = f"{market_data['funding_rate_annual'] < -50.0}_{market_data['is_sweep_candle']}_{market_data['price'] > market_data['vwap']}"
+    
     current_minutes = current_kst.hour * 60 + current_kst.minute
     target_minutes = 7 * 60 + 30
     
     is_daily_needed = (current_minutes >= target_minutes) and (state.get("last_daily_date") != kst_date_str)
-    is_state_changed = (state.get("last_score") != total_score) or (state.get("last_scenario") != scenario)
+    
+    # [핵심] 하이브리드 변동 감지 트리거 (50점 이상 돌파 OR 조건 C 상태 변동)
+    is_c_state_changed = (state.get("last_c_state") != current_c_state) and (state.get("last_c_state") is not None)
+    is_danger_score = total_score >= 50 and state.get("last_score", 0) < 50
     
     if is_daily_needed:
-        # [정규 브리핑] 발송
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DAILY")
         send_telegram_message(alert_message)
         
         state["last_daily_date"] = kst_date_str
         state["last_score"] = total_score
         state["last_scenario"] = scenario
+        state["last_c_state"] = current_c_state
         save_state(state)
         print("정규 브리핑 발송 완료")
         
-    elif is_state_changed and state.get("last_score") is not None:
-        # [지표 변동 알림] 발송 (최초 실행 시에는 변동 알림을 생략하기 위해 None 체크)
+    elif (is_c_state_changed or is_danger_score):
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="CHANGE")
         send_telegram_message(alert_message)
         
         state["last_score"] = total_score
         state["last_scenario"] = scenario
+        state["last_c_state"] = current_c_state
         save_state(state)
-        print("지표 변동 긴급 알림 발송 완료")
+        print("하이브리드 긴급 알림(타점 or 위험) 발송 완료")
         
-    elif state.get("last_score") is None:
-        # 시스템 최초 실행 시 데이터만 저장하고 침묵
+    elif state.get("last_c_state") is None:
+        # 최초 실행 시 데이터 저장
         state["last_score"] = total_score
         state["last_scenario"] = scenario
+        state["last_c_state"] = current_c_state
         save_state(state)
         print("시스템 최초 실행: 상태 저장 완료")
     else:
-        print("지표 변동 없음. 침묵을 유지합니다.")
+        print(f"지표 변동 없음 (스코어: {total_score}, 조건C: {current_c_state}). 침묵 유지.")
 
 if __name__ == "__main__":
     main()
