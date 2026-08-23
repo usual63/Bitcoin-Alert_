@@ -18,7 +18,8 @@ def load_state():
         "last_daily_date": None, 
         "last_score": None, 
         "last_scenario": None, 
-        "last_c_state": None, # [신규] 조건 C의 상태를 통째로 굽는 센서
+        "last_c_level": None,
+        "last_oi": None,
         "last_error_date": None
     }
 
@@ -30,44 +31,52 @@ def save_state(state):
         print(f"상태 저장 실패: {e}")
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (MEXC + Fear&Greed + CoinMetrics Free API)
+# [1] 실시간 API 데이터 수집 모듈 (MEXC + CoinMetrics + Coinbase)
 # =========================================================================
 
-def fetch_mvrv_ratio():
+def fetch_coinmetrics_data(metric):
     try:
         now = datetime.utcnow()
         start_str = (now - timedelta(days=5)).strftime('%Y-%m-%d')
-        url = f"https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=CapMVRVCur&start_time={start_str}&frequency=1d"
+        url = f"https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics={metric}&start_time={start_str}&frequency=1d"
         res = requests.get(url, timeout=10)
-        
         if res.status_code == 200:
             data = res.json().get('data', [])
-            if data:
-                return float(data[-1].get('CapMVRVCur', 1.0))
-    except Exception as e:
-        print(f"MVRV Ratio 통신 에러: {e}")
+            if data: return float(data[-1].get(metric, 1.0))
+    except: pass
     return 1.0 
 
 def fetch_fear_and_greed_index():
     try:
         res = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
-        if res.status_code == 200:
-            return int(res.json()['data'][0]['value'])
+        if res.status_code == 200: return int(res.json()['data'][0]['value'])
     except: pass
     return 50
 
+def fetch_coinbase_price():
+    try:
+        res = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
+        if res.status_code == 200: return float(res.json()['data']['amount'])
+    except: pass
+    return 0.0
+
 def fetch_market_data():
     market_data = {
-        'price': 0.0, 'funding_rate_annual': 0.0, 'bid_depth': 0.0,
+        'price': 0.0, 'funding_rate_annual': 0.0, 'oi_current': 0.0,
         'atr_15m_avg': 0.0, 'max_tr_15m': 0.0, 'vwap': 0.0,
-        'is_sweep_candle': False, 'stablecoin_peg': 1.0, 'rsi_1d': 50.0,
-        'price_to_ma20_ratio': 0.0, 'mvrv_ratio': 1.0, 'fear_greed_index': 50
+        'is_sweep_candle': False, 'stablecoin_peg': 1.0, 
+        'price_to_ma120_ratio': 0.0, 'mvrv_ratio': 1.0, 'sopr': 1.0, 'fear_greed_index': 50,
+        'buy_vol_ratio': 0.5, 'coinbase_premium': 0.0, 'price_drop_24h': 0.0,
+        'flash_crash_5m': False, 'basis_ratio': 0.0
     }
     headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
     
     try:
         market_data['fear_greed_index'] = fetch_fear_and_greed_index()
-        market_data['mvrv_ratio'] = fetch_mvrv_ratio()
+        market_data['mvrv_ratio'] = fetch_coinmetrics_data('CapMVRVCur')
+        market_data['sopr'] = fetch_coinmetrics_data('SOPR')
+        
+        cb_price = fetch_coinbase_price()
         
         ticker_url = "https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT"
         res_ticker = requests.get(ticker_url, headers=headers, timeout=10)
@@ -75,13 +84,24 @@ def fetch_market_data():
             ticker_data = res_ticker.json().get('data', {})
             market_data['price'] = float(ticker_data.get('lastPrice', 0))
             market_data['funding_rate_annual'] = float(ticker_data.get('fundingRate', 0)) * 3 * 365 * 100
+            market_data['oi_current'] = float(ticker_data.get('openInterest', ticker_data.get('holdVol', 0)))
+            
+        if cb_price > 0 and market_data['price'] > 0:
+            market_data['coinbase_premium'] = ((cb_price - market_data['price']) / market_data['price']) * 100
+            market_data['basis_ratio'] = ((market_data['price'] - cb_price) / cb_price) * 100
         
-        depth_url = "https://contract.mexc.com/api/v1/contract/depth/BTC_USDT?limit=50"
-        depth_res = requests.get(depth_url, headers=headers, timeout=10)
-        if depth_res.status_code == 200:
-            bids = depth_res.json().get('data', {}).get('bids', [])
-            market_data['bid_depth'] = sum([float(b[1]) * 0.0001 for b in bids if len(b) > 1])
-        
+        # 5분봉 쾌속 센서 (플래시 크래시 감지)
+        k5_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min5&limit=2"
+        k5_res = requests.get(k5_url, headers=headers, timeout=5)
+        if k5_res.status_code == 200:
+            k5_data = k5_res.json().get('data', {})
+            if len(k5_data.get('close', [])) >= 2:
+                open_5m = float(k5_data['open'][-1])
+                close_5m = float(k5_data['close'][-1])
+                if open_5m > 0 and ((close_5m - open_5m) / open_5m) <= -0.03:
+                    market_data['flash_crash_5m'] = True
+
+        # 15분봉 로직 (스윕 캔들, VWAP, 현물 CVD Proxy)
         klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
         k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
         if k15_res.status_code == 200:
@@ -89,24 +109,17 @@ def fetch_market_data():
             closes = k15_data.get('close', [])
             if len(closes) > 2:
                 times, opens, highs, lows, vols = k15_data['time'], k15_data['open'], k15_data['high'], k15_data['low'], k15_data['vol']
-                tr_list, typical_price_vol, total_vol = [], 0, 0
+                typical_price_vol, total_vol = 0, 0
                 now_utc_date = datetime.utcnow().date()
-                
-                recent_start_idx = max(1, len(closes) - 14)
-                for i in range(recent_start_idx, len(closes)):
-                    high, low, close_prev = float(highs[i]), float(lows[i]), float(closes[i-1])
-                    tr_list.append(max(high - low, abs(high - close_prev), abs(low - close_prev)))
                 
                 for i in range(1, len(closes)):
                     ts = float(times[i])
                     if ts > 1e11: ts = ts / 1000
-                    candle_date = datetime.utcfromtimestamp(ts).date()
-                    if candle_date == now_utc_date:
+                    if datetime.utcfromtimestamp(ts).date() == now_utc_date:
                         high, low, close_curr, vol = float(highs[i]), float(lows[i]), float(closes[i]), float(vols[i])
                         typical_price_vol += ((high + low + close_curr) / 3) * vol
                         total_vol += vol
                         
-                market_data['max_tr_15m'] = max(tr_list) if tr_list else 0
                 market_data['vwap'] = typical_price_vol / total_vol if total_vol > 0 else market_data['price']
                 
                 body = abs(float(closes[-2]) - float(opens[-2]))
@@ -114,30 +127,21 @@ def fetch_market_data():
                 if lower_wick > (body * 2) and lower_wick > (market_data['price'] * 0.002): 
                     market_data['is_sweep_candle'] = True
 
-        klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=100"
+                recent_buy_vol = sum([float(vols[i]) for i in range(-5, 0) if float(closes[i]) > float(opens[i])])
+                recent_total_vol = sum([float(vols[i]) for i in range(-5, 0)])
+                market_data['buy_vol_ratio'] = (recent_buy_vol / recent_total_vol) if recent_total_vol > 0 else 0.5
+
+        # 1일봉 로직 (MA120, 24시간 절대 낙폭)
+        klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=150"
         k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
         if k1d_res.status_code == 200:
             k1d_data = k1d_res.json().get('data', {})
             closes_1d = [float(c) for c in k1d_data.get('close', [])]
-            
-            if len(closes_1d) >= 20:
-                ma20 = sum(closes_1d[-20:]) / 20
-                market_data['price_to_ma20_ratio'] = (market_data['price'] - ma20) / ma20
-                
-                if len(closes_1d) >= 15:
-                    diffs = [closes_1d[i] - closes_1d[i-1] for i in range(1, len(closes_1d))]
-                    gains = [d if d > 0 else 0 for d in diffs]
-                    losses = [abs(d) if d < 0 else 0 for d in diffs]
-                    
-                    avg_gain = sum(gains[:14]) / 14
-                    avg_loss = sum(losses[:14]) / 14
-                    
-                    for i in range(14, len(diffs)):
-                        avg_gain = (avg_gain * 13 + gains[i]) / 14
-                        avg_loss = (avg_loss * 13 + losses[i]) / 14
-                        
-                    if avg_loss == 0: market_data['rsi_1d'] = 100.0
-                    else: market_data['rsi_1d'] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+            if len(closes_1d) >= 120:
+                ma120 = sum(closes_1d[-120:]) / 120
+                market_data['price_to_ma120_ratio'] = (market_data['price'] - ma120) / ma120
+            if len(closes_1d) >= 2:
+                market_data['price_drop_24h'] = ((market_data['price'] - closes_1d[-2]) / closes_1d[-2]) * 100
 
         peg_url = "https://api.mexc.com/api/v3/ticker/price?symbol=USDCUSDT"
         peg_res = requests.get(peg_url, headers=headers, timeout=10)
@@ -150,105 +154,124 @@ def fetch_market_data():
     return market_data
 
 # =========================================================================
-# [2] 하이브리드 전략 엔진
+# [2] 하이브리드 전략 엔진 (V4 무결성 가중치 및 논리 회로)
 # =========================================================================
 
-def analyze_strategy(market):
+def analyze_strategy(market, past_oi):
     score = 0
-    if market['mvrv_ratio'] >= 3.0: score += 20
-    elif market['mvrv_ratio'] >= 2.4: score += 10
     
-    if market['fear_greed_index'] >= 85: score += 20
-    elif market['fear_greed_index'] >= 75: score += 10
+    # 1. 온체인 절대 가치 평가 (최대 40점)
+    if market['mvrv_ratio'] >= 3.0: score += 40
+    elif market['mvrv_ratio'] >= 2.4: score += 20
     
-    if market['funding_rate_annual'] > 50.0: score += 20
-    elif market['funding_rate_annual'] > 20.0: score += 10
+    # 2. 파생 거품 및 과열 (최대 30점)
+    if market['funding_rate_annual'] > 50.0: score += 30
+    elif market['funding_rate_annual'] > 20.0: score += 15
     
-    if market['rsi_1d'] > 80.0: score += 20
-    elif market['rsi_1d'] > 70.0: score += 10
+    # 3. 스마트머니 이탈 감지 (최대 20점)
+    if market['sopr'] >= 1.05: score += 20
+    elif market['sopr'] >= 1.02: score += 10
     
-    if market['price_to_ma20_ratio'] > 0.20: score += 20 
-    elif market['price_to_ma20_ratio'] > 0.10: score += 10 
+    # 4. 투심 및 이격도 (최대 10점)
+    if market['fear_greed_index'] >= 80: score += 5
+    if market['price_to_ma120_ratio'] > 0.30: score += 5 
 
+    # [조건 B] 블랙스완 킬 스위치 (1Hit-Kill)
     is_blackswan = False
+    oi_drop_ratio = 0.0
+    if past_oi and past_oi > 0 and market['oi_current'] > 0:
+        oi_drop_ratio = ((past_oi - market['oi_current']) / past_oi) * 100
+        
     if market['stablecoin_peg'] < 0.985: is_blackswan = True
-    if market['bid_depth'] < 20: is_blackswan = True
-    if market['max_tr_15m'] > (market['price'] * 0.05): is_blackswan = True
+    if oi_drop_ratio >= 5.0: is_blackswan = True
+    if market['flash_crash_5m']: is_blackswan = True
+    if market['basis_ratio'] < -5.0: is_blackswan = True
+    if market['price_drop_24h'] < -10.0: is_blackswan = True
 
-    rescue_triggers = 0
-    if market['funding_rate_annual'] < -50.0: rescue_triggers += 1
-    if market['is_sweep_candle']: rescue_triggers += 1
-    if market['price'] > market['vwap']: rescue_triggers += 1
+    # [조건 C] 현물 딥바잉 스나이퍼 (메인/서브 다차원 교차 검증)
+    main_keys = 0
+    if market['coinbase_premium'] > 0.05: main_keys += 1
+    if market['buy_vol_ratio'] > 0.60: main_keys += 1
+        
+    sub_keys = 0
+    if market['funding_rate_annual'] < -50.0: sub_keys += 1
+    if market['is_sweep_candle']: sub_keys += 1
+    if market['price'] > market['vwap']: sub_keys += 1
     
-    is_rescue = (rescue_triggers >= 2)
+    c_level = 0
+    if main_keys == 0 and sub_keys >= 1: 
+        c_level = 1
+    elif main_keys >= 1 and sub_keys >= 1: 
+        c_level = 2
+    elif main_keys == 2 and sub_keys >= 1: 
+        c_level = 3
 
-    if is_blackswan:
-        if is_rescue: return 'C', score
-        return 'B', score
-    return 'A', score
+    scenario = 'B' if is_blackswan else 'A'
+    
+    return scenario, score, c_level, oi_drop_ratio
 
 # =========================================================================
 # [3] 동적 텔레그램 메시지 발송
 # =========================================================================
 
-def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DAILY"):
+def get_strategy_message(scenario_type, btc_price, score, c_level, market, oi_drop_ratio, alert_mode="DAILY"):
     
-    mvrv = market['mvrv_ratio']
-    if mvrv >= 3.0: mvrv_stat = f"🔴 위험 (MVRV 비율 {mvrv:.2f} 역사적 고평가)"
-    elif mvrv >= 2.4: mvrv_stat = f"🟠 경고 (MVRV 비율 {mvrv:.2f} 강세장 후반)"
-    else: mvrv_stat = f"🟢 안전 (MVRV 비율 {mvrv:.2f} 정상 궤도)"
+    mvrv_stat = f"🔴 위험 (MVRV {market['mvrv_ratio']:.2f})" if market['mvrv_ratio'] >= 3.0 else f"🟢 안전 (MVRV {market['mvrv_ratio']:.2f})"
+    sopr_stat = f"🔴 이탈 (SOPR {market['sopr']:.2f})" if market['sopr'] >= 1.05 else f"🟢 안전 (SOPR {market['sopr']:.2f})"
+    fr_stat = f"🔴 과열 ({market['funding_rate_annual']:.1f}%)" if market['funding_rate_annual'] > 50.0 else f"🟢 정상"
+    fgi_stat = f"🔴 탐욕 ({market['fear_greed_index']})" if market['fear_greed_index'] >= 80 else f"🟢 보통 ({market['fear_greed_index']})"
     
-    fgi = market['fear_greed_index']
-    if fgi >= 85: fgi_stat = f"🔴 위험 (극단적 탐욕 {fgi})"
-    elif fgi >= 75: fgi_stat = f"🟠 경고 (탐욕 진입 {fgi})"
-    else: fgi_stat = f"🟢 안전 (중립 또는 공포 {fgi})"
-
-    fr = market['funding_rate_annual']
-    if fr > 50.0: fr_stat = f"🔴 위험 (연환산 {fr:.1f}% 과열)"
-    elif fr > 20.0: fr_stat = f"🟠 경고 (연환산 {fr:.1f}% 누적)"
-    else: fr_stat = f"🟢 안전 (정상 펀딩비)"
-
-    rsi = market['rsi_1d']
-    if rsi > 80.0: rsi_stat = f"🔴 위험 (1D RSI {rsi:.1f} 한계)"
-    elif rsi > 70.0: rsi_stat = f"🟠 경고 (1D RSI {rsi:.1f} 과매수)"
-    else: rsi_stat = f"🟢 안전 (1D RSI {rsi:.1f} 안정권)"
-
-    ma_ratio = market['price_to_ma20_ratio'] * 100
-    if ma_ratio > 20.0: ma_stat = f"🔴 위험 (1D MA20 대비 +{ma_ratio:.1f}% 폭등)"
-    elif ma_ratio > 10.0: ma_stat = f"🟡 주의 (1D MA20 이격 상승)"
-    else: ma_stat = f"🟢 안전 (이평선 안착)"
-
     peg_stat = "🔴 위험 (디페깅)" if market['stablecoin_peg'] < 0.985 else "🟢 안전"
-    depth_stat = "🔴 위험 (호가 진공)" if market['bid_depth'] < 20 else "🟢 안전"
-    atr_stat = "🔴 위험 (변동성 폭발)" if market['max_tr_15m'] > (btc_price * 0.05) else "🟢 안전"
+    oi_drop_stat = f"🔴 위험 ({oi_drop_ratio:.1f}% 증발)" if oi_drop_ratio >= 5.0 else f"🟢 방어"
+    flash_stat = "🔴 위험 (투매 발생)" if market['flash_crash_5m'] else "🟢 안전"
+    basis_stat = f"🔴 위험 ({market['basis_ratio']:.1f}%)" if market['basis_ratio'] < -5.0 else "🟢 안전"
+    drop_stat = f"🔴 위험 ({market['price_drop_24h']:.1f}%)" if market['price_drop_24h'] < -10.0 else "🟢 안전"
 
-    # [수정] 조건 C (현물 구조대) 상태 텍스트
-    is_sweep = market['is_sweep_candle']
-    is_vwap_above = market['price'] > market['vwap']
+    cbp = market['coinbase_premium']
+    buy_ratio = market['buy_vol_ratio'] * 100
+    fr = market['funding_rate_annual']
     
-    fr_c_stat = f"🔴 숏 과열 (연환산 {fr:.1f}%)" if fr < -50.0 else f"⚪ 대기 (연환산 {fr:.1f}%)"
-    sweep_stat = "🟢 포착됨 (현물 방어)" if is_sweep else "⚪ 대기"
-    vwap_stat = "🟢 상향 돌파 (현물 매수 우위)" if is_vwap_above else "⚪ 하회"
+    cbp_stat = f"🟢 기관 유입 ({cbp:.3f}%)" if cbp > 0.05 else f"⚪ 대기 ({cbp:.3f}%)"
+    cvd_stat = f"🟢 순매수 리드 ({buy_ratio:.1f}%)" if market['buy_vol_ratio'] > 0.60 else f"⚪ 대기 ({buy_ratio:.1f}%)"
+    fr_c_stat = f"🟢 숏 과밀 ({fr:.1f}%)" if fr < -50.0 else f"⚪ 대기 ({fr:.1f}%)"
+    sweep_stat = "🟢 꼬리 방어" if market['is_sweep_candle'] else "⚪ 대기"
+    vwap_stat = "🟢 상향 돌파" if market['price'] > market['vwap'] else "⚪ 대기"
+
+    if c_level == 0:
+        c_decision = "➔ 판정: ⚪ 대기 (특이사항 없음)"
+    elif c_level == 1:
+        c_decision = "➔ 판정: ⚪ 휩쏘 경계 (현물 주체 미확인)"
+    elif c_level == 2:
+        c_decision = "➔ 판정: 🟡 1차 분할 진입 (세력 개입 및 찐반등 초입)"
+    else:
+        c_decision = "➔ 판정: 🟢 강력 매수 스나이핑 (기관 유입 및 100% 스퀴즈 확정)"
 
     cond_a_block = f"""══════════════════════
 <b>[조건 A: 온체인/파생/심리 복합 과열 현황]</b>
-• 온체인 MVRV(20): {mvrv_stat}
-• 공포 탐욕(20): {fgi_stat}
-• 파생 과열(20): {fr_stat}
-• 매크로 RSI(20): {rsi_stat}
-• 이평선 이격(20): {ma_stat}"""
+<i>(💡 시장이 서서히 과열되며 파생 레버리지 거품이 끼고 있는지를 진단하는 중장기 관점의 사이클 고점 경보기)</i>
+• 온체인 MVRV(40): {mvrv_stat}
+• 파생 레버리지(30): {fr_stat}
+• 고래 엑시트(20): {sopr_stat}
+• 심리 및 이격도(10): {fgi_stat}"""
 
     cond_b_block = f"""══════════════════════
 <b>[조건 B: 블랙스완 킬 스위치 현황]</b>
-• 스테이블 뱅크런: {peg_stat}
-• 오더북 뎁스 붕괴: {depth_stat}
-• 청산맵/ATR 폭발: {atr_stat}"""
+<i>(💡 건강한 조정이 아닌 시스템 붕괴(연쇄 청산 등)로 인해 즉각 대피해야 할 폭락장 시작 신호)</i>
+• 뱅크런 방어: {peg_stat}
+• 15분 청산맵: {oi_drop_stat}
+• 5분 투매/베이시스: {flash_stat} / {basis_stat}
+• 24시간 계단식 폭락: {drop_stat}
+➔ 판정: {"🔴 대피 (시스템 장악)" if scenario_type == 'B' else "🟢 안전 (조건 미달)"}"""
 
     cond_c_block = f"""══════════════════════
 <b>[조건 C: 숏 스퀴즈 현물 구조대 현황]</b>
-• 펀딩비 극음수: {fr_c_stat}
-• 스윕 캔들 출현: {sweep_stat}
-• VWAP 상향 돌파: {vwap_stat}"""
+<i>(💡 모두가 던지는 공포의 하락장 속에서 현물 세력이 바닥을 주워 담는 단기 V자 반등 딥바잉 스나이퍼)</i>
+• 코베 프리미엄 (Main): {cbp_stat}
+• 현물 CVD (Main): {cvd_stat}
+• 펀딩비 극음수 (Sub): {fr_c_stat}
+• 스윕 캔들 (Sub): {sweep_stat}
+• VWAP 상향 (Sub): {vwap_stat}
+{c_decision}"""
 
     if score >= 80:
         action_advice = "대중의 탐욕과 온체인 과열이 극에 달한 사이클 고점입니다. 즉시 모든 자산을 현금화하십시오."
@@ -275,10 +298,8 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 {cond_a_block}
 
 {cond_b_block}
-➔ 판정: 🟢 안전 (조건 미달)
 
 {cond_c_block}
-➔ 판정: ⚪ 대기 (조건 미달)
 
 💡 <b>시스템 판독 및 행동 지침</b>: 
 {action_advice}"""
@@ -292,29 +313,11 @@ def get_strategy_message(scenario_type, btc_price, score, market, alert_mode="DA
 {cond_a_block}
 
 {cond_b_block}
-➔ 판정: 🔴 대피 (시스템 장악)
 
 {cond_c_block}
-➔ 판정: ⚪ 대기 (구조대 미도착)
 
-💡 <b>시스템 판독 및 행동 지침</b>:
-시장 미시구조의 진공 상태 또는 연쇄 청산이 감지되었습니다. 스코어와 무관하게 즉시 모든 레버리지 및 현물을 전량 매도하고 대피하십시오."""
-
-    elif scenario_type == 'C':
-        return f"""{prefix}<b>🟢 [초고속 재진입] 비트코인 숏 스퀴즈 구조대 발동</b>
-
-🚀 타겟 자산: BTC (${btc_price:,.2f})
-⏱️ 상태: 블랙스완 대피 이후 현물 세력 개입(V자 랠리) 포착
-
-{cond_a_block}
-
-{cond_b_block}
-
-{cond_c_block}
-➔ 판정: 🟢 출동 (강제 재진입 승인)
-
-💡 <b>시스템 판독 및 행동 지침</b>:
-세력의 유동성 사냥(Liquidity Sweep)이 종료되었습니다. 블랙스완 매도 상태를 오버라이드하고 즉시 롱 포지션 및 현물을 재진입하여 V자 반등 수익을 확보하십시오."""
+💡 <b>비상 행동 지침</b>:
+시장 미시구조의 붕괴 및 연쇄 청산이 감지되었습니다. 스코어와 무관하게 즉시 모든 레버리지 및 현물을 전량 매도하고 대피하십시오."""
     
     return "전략 오류"
 
@@ -328,15 +331,16 @@ def send_telegram_message(text):
     except: pass
 
 def main():
-    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (Hybrid Event-Driven Edition)...")
+    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (V4 Master Architecture)...")
     
     current_kst = datetime.utcnow() + timedelta(hours=9)
     kst_date_str = current_kst.strftime('%Y-%m-%d')
     
+    state = load_state()
+    past_oi = state.get("last_oi", 0.0)
+    
     market_data = fetch_market_data()
     btc_current_price = market_data.get('price', 0.0)
-    
-    state = load_state()
     
     if btc_current_price == 0.0:
         if state.get("last_error_date") != kst_date_str:
@@ -345,50 +349,42 @@ def main():
             save_state(state)
         return
         
-    scenario, total_score = analyze_strategy(market_data)
-    
-    # [핵심] 조건 C의 현재 상태를 통째로 굽는 센서 (Boolean 조합)
-    current_c_state = f"{market_data['funding_rate_annual'] < -50.0}_{market_data['is_sweep_candle']}_{market_data['price'] > market_data['vwap']}"
+    scenario, total_score, current_c_level, oi_drop_ratio = analyze_strategy(market_data, past_oi)
     
     current_minutes = current_kst.hour * 60 + current_kst.minute
     target_minutes = 7 * 60 + 30
     
     is_daily_needed = (current_minutes >= target_minutes) and (state.get("last_daily_date") != kst_date_str)
     
-    # [핵심] 하이브리드 변동 감지 트리거 (50점 이상 돌파 OR 조건 C 상태 변동)
-    is_c_state_changed = (state.get("last_c_state") != current_c_state) and (state.get("last_c_state") is not None)
+    is_color_changed = (state.get("last_c_level") != current_c_level) and (state.get("last_c_level") is not None)
     is_danger_score = total_score >= 50 and state.get("last_score", 0) < 50
+    is_scenario_changed = (state.get("last_scenario") != scenario) and (state.get("last_scenario") is not None)
+    
+    state["last_score"] = total_score
+    state["last_scenario"] = scenario
+    state["last_c_level"] = current_c_level
+    if market_data['oi_current'] > 0:
+        state["last_oi"] = market_data['oi_current'] 
     
     if is_daily_needed:
-        alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="DAILY")
+        alert_message = get_strategy_message(scenario, btc_current_price, total_score, current_c_level, market_data, oi_drop_ratio, alert_mode="DAILY")
         send_telegram_message(alert_message)
-        
         state["last_daily_date"] = kst_date_str
-        state["last_score"] = total_score
-        state["last_scenario"] = scenario
-        state["last_c_state"] = current_c_state
         save_state(state)
         print("정규 브리핑 발송 완료")
         
-    elif (is_c_state_changed or is_danger_score):
-        alert_message = get_strategy_message(scenario, btc_current_price, total_score, market_data, alert_mode="CHANGE")
+    elif (is_color_changed or is_danger_score or is_scenario_changed):
+        alert_message = get_strategy_message(scenario, btc_current_price, total_score, current_c_level, market_data, oi_drop_ratio, alert_mode="CHANGE")
         send_telegram_message(alert_message)
-        
-        state["last_score"] = total_score
-        state["last_scenario"] = scenario
-        state["last_c_state"] = current_c_state
         save_state(state)
-        print("하이브리드 긴급 알림(타점 or 위험) 발송 완료")
+        print(f"색깔 변동 또는 위험 감지 긴급 알림 발송 완료 (C등급: {current_c_level})")
         
-    elif state.get("last_c_state") is None:
-        # 최초 실행 시 데이터 저장
-        state["last_score"] = total_score
-        state["last_scenario"] = scenario
-        state["last_c_state"] = current_c_state
+    elif state.get("last_c_level") is None:
         save_state(state)
         print("시스템 최초 실행: 상태 저장 완료")
     else:
-        print(f"지표 변동 없음 (스코어: {total_score}, 조건C: {current_c_state}). 침묵 유지.")
+        save_state(state)
+        print(f"지표 변동 없음 (스코어: {total_score}, C등급: {current_c_level}). 침묵 유지.")
 
 if __name__ == "__main__":
     main()
