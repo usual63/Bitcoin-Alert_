@@ -4,9 +4,22 @@ import requests
 from datetime import datetime, timedelta
 
 # =========================================================================
-# [0] 상태(State) 저장 및 로드 모듈 (기억 상실 방지)
+# [0] 텔레그램 메시지 발송 모듈 (에러 보고를 위해 상단 배치)
 # =========================================================================
-STATE_FILE = "alert_state.json"
+def send_telegram_message(text):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id: return
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
+                      json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+    except: pass
+
+# =========================================================================
+# [1] 상태(State) 저장 및 로드 모듈 (경로 무결성 및 에러 추적 패치)
+# =========================================================================
+base_dir = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(base_dir, "alert_state.json")
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -29,11 +42,11 @@ def save_state(state):
             json.dump(state, f)
     except Exception as e:
         print(f"상태 저장 실패: {e}")
+        send_telegram_message(f"🚨 <b>[시스템 에러]</b> alert_state.json 파일 저장 실패. 권한/경로를 확인하세요. ({e})")
 
 # =========================================================================
-# [1] 실시간 API 데이터 수집 모듈 (MEXC + CoinMetrics + Coinbase)
+# [2] 실시간 API 데이터 수집 모듈 (MEXC + CoinMetrics + Coinbase)
 # =========================================================================
-
 def fetch_coinmetrics_data(metric):
     try:
         now = datetime.utcnow()
@@ -90,7 +103,6 @@ def fetch_market_data():
             market_data['coinbase_premium'] = ((cb_price - market_data['price']) / market_data['price']) * 100
             market_data['basis_ratio'] = ((market_data['price'] - cb_price) / cb_price) * 100
         
-        # 5분봉 쾌속 센서 (플래시 크래시 감지)
         k5_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min5&limit=2"
         k5_res = requests.get(k5_url, headers=headers, timeout=5)
         if k5_res.status_code == 200:
@@ -101,7 +113,6 @@ def fetch_market_data():
                 if open_5m > 0 and ((close_5m - open_5m) / open_5m) <= -0.03:
                     market_data['flash_crash_5m'] = True
 
-        # 15분봉 로직 (스윕 캔들, VWAP, 현물 CVD Proxy)
         klines_15m_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&limit=100"
         k15_res = requests.get(klines_15m_url, headers=headers, timeout=10)
         if k15_res.status_code == 200:
@@ -131,7 +142,6 @@ def fetch_market_data():
                 recent_total_vol = sum([float(vols[i]) for i in range(-5, 0)])
                 market_data['buy_vol_ratio'] = (recent_buy_vol / recent_total_vol) if recent_total_vol > 0 else 0.5
 
-        # 1일봉 로직 (MA120, 24시간 절대 낙폭)
         klines_1d_url = "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Day1&limit=150"
         k1d_res = requests.get(klines_1d_url, headers=headers, timeout=10)
         if k1d_res.status_code == 200:
@@ -154,29 +164,23 @@ def fetch_market_data():
     return market_data
 
 # =========================================================================
-# [2] 하이브리드 전략 엔진 (V4 무결성 가중치 및 논리 회로)
+# [3] 하이브리드 전략 엔진 (V4 무결성 가중치 및 논리 회로)
 # =========================================================================
-
 def analyze_strategy(market, past_oi):
     score = 0
     
-    # 1. 온체인 절대 가치 평가 (최대 40점)
     if market['mvrv_ratio'] >= 3.0: score += 40
     elif market['mvrv_ratio'] >= 2.4: score += 20
     
-    # 2. 파생 거품 및 과열 (최대 30점)
     if market['funding_rate_annual'] > 50.0: score += 30
     elif market['funding_rate_annual'] > 20.0: score += 15
     
-    # 3. 스마트머니 이탈 감지 (최대 20점)
     if market['sopr'] >= 1.05: score += 20
     elif market['sopr'] >= 1.02: score += 10
     
-    # 4. 투심 및 이격도 (최대 10점)
     if market['fear_greed_index'] >= 80: score += 5
     if market['price_to_ma120_ratio'] > 0.30: score += 5 
 
-    # [조건 B] 블랙스완 킬 스위치 (1Hit-Kill)
     is_blackswan = False
     oi_drop_ratio = 0.0
     if past_oi and past_oi > 0 and market['oi_current'] > 0:
@@ -188,7 +192,6 @@ def analyze_strategy(market, past_oi):
     if market['basis_ratio'] < -5.0: is_blackswan = True
     if market['price_drop_24h'] < -10.0: is_blackswan = True
 
-    # [조건 C] 현물 딥바잉 스나이퍼 (메인/서브 다차원 교차 검증)
     main_keys = 0
     if market['coinbase_premium'] > 0.05: main_keys += 1
     if market['buy_vol_ratio'] > 0.60: main_keys += 1
@@ -211,9 +214,8 @@ def analyze_strategy(market, past_oi):
     return scenario, score, c_level, oi_drop_ratio
 
 # =========================================================================
-# [3] 동적 텔레그램 메시지 발송
+# [4] 동적 텔레그램 메시지 생성
 # =========================================================================
-
 def get_strategy_message(scenario_type, btc_price, score, c_level, market, oi_drop_ratio, alert_mode="DAILY"):
     
     mvrv_stat = f"🔴 위험 (MVRV {market['mvrv_ratio']:.2f})" if market['mvrv_ratio'] >= 3.0 else f"🟢 안전 (MVRV {market['mvrv_ratio']:.2f})"
@@ -321,17 +323,11 @@ def get_strategy_message(scenario_type, btc_price, score, c_level, market, oi_dr
     
     return "전략 오류"
 
-def send_telegram_message(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id: return
-    try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", 
-                      json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
-    except: pass
-
+# =========================================================================
+# [5] 메인 실행 함수
+# =========================================================================
 def main():
-    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (V4 Master Architecture)...")
+    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (V4 - State Path Fix Edition)...")
     
     current_kst = datetime.utcnow() + timedelta(hours=9)
     kst_date_str = current_kst.strftime('%Y-%m-%d')
@@ -356,6 +352,7 @@ def main():
     
     is_daily_needed = (current_minutes >= target_minutes) and (state.get("last_daily_date") != kst_date_str)
     
+    # [롤백 완료] C레벨이 기존과 다르면 무조건 발송 (기존 V4 로직 복구)
     is_color_changed = (state.get("last_c_level") != current_c_level) and (state.get("last_c_level") is not None)
     is_danger_score = total_score >= 50 and state.get("last_score", 0) < 50
     is_scenario_changed = (state.get("last_scenario") != scenario) and (state.get("last_scenario") is not None)
