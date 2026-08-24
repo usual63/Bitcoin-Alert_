@@ -16,7 +16,7 @@ def send_telegram_message(text):
     except: pass
 
 # =========================================================================
-# [1] 상태(State) 저장 및 로드 모듈 (경로 무결성 및 에러 추적 패치)
+# [1] 상태(State) 저장 및 로드 모듈 (경로 무결성 유지)
 # =========================================================================
 base_dir = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(base_dir, "alert_state.json")
@@ -29,9 +29,9 @@ def load_state():
         except: pass
     return {
         "last_daily_date": None, 
-        "last_score": None, 
-        "last_scenario": None, 
-        "last_c_level": None,
+        "last_score": 0, 
+        "last_scenario": 'A', 
+        "last_c_level": 0,
         "last_oi": None,
         "last_error_date": None
     }
@@ -324,10 +324,10 @@ def get_strategy_message(scenario_type, btc_price, score, c_level, market, oi_dr
     return "전략 오류"
 
 # =========================================================================
-# [5] 메인 실행 함수
+# [5] 메인 실행 함수 (스마트 알림 센서 완벽 탑재)
 # =========================================================================
 def main():
-    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (V4 - State Path Fix Edition)...")
+    print(f"[{datetime.utcnow()}] 비트코인 퀀트 전략 시스템 스캔 시작 (V4 - Smart Alert Edition)...")
     
     current_kst = datetime.utcnow() + timedelta(hours=9)
     kst_date_str = current_kst.strftime('%Y-%m-%d')
@@ -352,11 +352,29 @@ def main():
     
     is_daily_needed = (current_minutes >= target_minutes) and (state.get("last_daily_date") != kst_date_str)
     
-    # [롤백 완료] C레벨이 기존과 다르면 무조건 발송 (기존 V4 로직 복구)
-    is_color_changed = (state.get("last_c_level") != current_c_level) and (state.get("last_c_level") is not None)
-    is_danger_score = total_score >= 50 and state.get("last_score", 0) < 50
-    is_scenario_changed = (state.get("last_scenario") != scenario) and (state.get("last_scenario") is not None)
+    # ---------------------------------------------------------
+    # 스마트 알림 로직 (노이즈 캔슬링)
+    # ---------------------------------------------------------
+    last_c = state.get("last_c_level") if state.get("last_c_level") is not None else 0
+    last_score = state.get("last_score", 0)
+    last_scenario = state.get("last_scenario", 'A')
     
+    def get_score_tier(s):
+        if s >= 80: return 3
+        elif s >= 50: return 2
+        elif s >= 30: return 1
+        return 0
+        
+    current_tier = get_score_tier(total_score)
+    last_tier = get_score_tier(last_score)
+    
+    is_score_upgraded = current_tier > last_tier
+    is_blackswan_triggered = (last_scenario == 'A' and scenario == 'B')
+    is_c_level_upgraded = (current_c_level > last_c) and (current_c_level >= 2)
+    
+    is_smart_alert = (is_score_upgraded or is_blackswan_triggered or is_c_level_upgraded)
+    
+    # 상태 갱신
     state["last_score"] = total_score
     state["last_scenario"] = scenario
     state["last_c_level"] = current_c_level
@@ -370,11 +388,11 @@ def main():
         save_state(state)
         print("정규 브리핑 발송 완료")
         
-    elif (is_color_changed or is_danger_score or is_scenario_changed):
+    elif is_smart_alert:
         alert_message = get_strategy_message(scenario, btc_current_price, total_score, current_c_level, market_data, oi_drop_ratio, alert_mode="CHANGE")
         send_telegram_message(alert_message)
         save_state(state)
-        print(f"색깔 변동 또는 위험 감지 긴급 알림 발송 완료 (C등급: {current_c_level})")
+        print("스마트 알림 조건 충족 긴급 발송 완료")
         
     elif state.get("last_c_level") is None:
         save_state(state)
