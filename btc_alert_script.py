@@ -449,7 +449,7 @@ def get_strategy_message(scenario_type, btc_price, score, c_level, market, oi_dr
     # 조건 C 세부 상태 텍스트
     cbp = market['coinbase_premium']
     buy_ratio = market['buy_vol_ratio'] * 100
-    vwap_ cross = (market['price'] > market['vwap_24h']) and market['was_below_vwap']
+    vwap_cross = (market['price'] > market['vwap_24h']) and market['was_below_vwap']
 
     cbp_stat = f"🟢 기관 유입 ({cbp:+.3f}%)" if cbp > 0.05 else f"⚪ 대기 ({cbp:+.3f}%)"
     cvd_stat = f"🟢 순매수 리드 ({buy_ratio:.1f}%)" if market['buy_vol_ratio'] > 0.60 else f"⚪ 대기 ({buy_ratio:.1f}%)"
