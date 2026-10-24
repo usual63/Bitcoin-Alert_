@@ -1,6 +1,6 @@
 {
   "last_daily_date": "2026-10-24",
-  "last_score": 0,
+  "last_score": 5,
   "last_scenario": "A",
   "last_error_date": "2026-09-21",
   "last_dca_stage": "Hold & Wait",
@@ -34,12 +34,16 @@
     {
       "ts": 1792843848.102219,
       "oi": 489172105.0
+    },
+    {
+      "ts": 1792858286.836278,
+      "oi": 506821770.0
     }
   ],
   "last_market_cache": {
     "mvrv_ratio": 1.4968103438762337,
-    "sopr_proxy": 0.9891684928047229,
+    "sopr_proxy": 0.9859826343042545,
     "fear_greed_index": 51,
-    "cb_price": 80493.735
+    "cb_price": 79720.205
   }
 }
