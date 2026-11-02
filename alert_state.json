@@ -7,18 +7,10 @@
   "daily_open_price": 78268.5,
   "daily_open_oi": 0.0,
   "last_c_state": "False_False_False",
-  "last_c_level": 1,
+  "last_c_level": 0,
   "last_oi": 440101569.0,
   "is_initialized": true,
   "oi_history": [
-    {
-      "ts": 1793542380.370021,
-      "oi": 594847474.0
-    },
-    {
-      "ts": 1793559956.401175,
-      "oi": 599471899.0
-    },
     {
       "ts": 1793573007.351297,
       "oi": 591509555.0
@@ -30,12 +22,16 @@
     {
       "ts": 1793613149.891799,
       "oi": 587103035.0
+    },
+    {
+      "ts": 1793650365.878621,
+      "oi": 584876522.0
     }
   ],
   "last_market_cache": {
     "mvrv_ratio": 1.446503145463846,
-    "sopr_proxy": 0.9849695720796201,
+    "sopr_proxy": 0.9799334560546943,
     "fear_greed_index": 37,
-    "cb_price": 78031.145
+    "cb_price": 76798.895
   }
 }
