@@ -1,7 +1,7 @@
 {
-  "last_daily_date": "2026-11-12",
+  "last_daily_date": "2026-11-13",
   "last_score": 0,
-  "last_scenario": "B",
+  "last_scenario": "A",
   "last_error_date": "2026-09-21",
   "last_dca_stage": "Hold & Wait",
   "daily_open_price": 78268.5,
@@ -11,10 +11,6 @@
   "last_oi": 440101569.0,
   "is_initialized": true,
   "oi_history": [
-    {
-      "ts": 1794431623.049845,
-      "oi": 676428054.0
-    },
     {
       "ts": 1794450431.948901,
       "oi": 663185564.0
@@ -26,12 +22,16 @@
     {
       "ts": 1794508338.414977,
       "oi": 617563848.0
+    },
+    {
+      "ts": 1794527352.312544,
+      "oi": 618925638.0
     }
   ],
   "last_market_cache": {
     "mvrv_ratio": 1.3697140832346657,
-    "sopr_proxy": 0.9690414477142963,
+    "sopr_proxy": 0.9663925364060919,
     "fear_greed_index": 28,
-    "cb_price": 71895.895
+    "cb_price": 71290.125
   }
 }
