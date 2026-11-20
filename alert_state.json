@@ -1,5 +1,5 @@
 {
-  "last_daily_date": "2026-11-20",
+  "last_daily_date": "2026-11-21",
   "last_score": 5,
   "last_scenario": "A",
   "last_error_date": "2026-09-21",
@@ -12,10 +12,6 @@
   "is_initialized": true,
   "oi_history": [
     {
-      "ts": 1795108546.05515,
-      "oi": 417503096.0
-    },
-    {
       "ts": 1795131884.758835,
       "oi": 407355472.0
     },
@@ -26,12 +22,16 @@
     {
       "ts": 1795190459.767954,
       "oi": 472525812.0
+    },
+    {
+      "ts": 1795214129.539016,
+      "oi": 485656326.0
     }
   ],
   "last_market_cache": {
     "mvrv_ratio": 1.158746124163798,
-    "sopr_proxy": 0.93361342017266,
+    "sopr_proxy": 0.932217821287402,
     "fear_greed_index": 12,
-    "cb_price": 59241.48
+    "cb_price": 58932.775
   }
 }
